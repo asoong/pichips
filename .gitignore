@@ -1,5 +1,15 @@
 .venv/
 __pycache__/
+
+# Model weights (download separately)
 *.pt
+*.onnx
+*.pth
+models/*.pt
+models/*.onnx
+models/*.pth
+
+# Environment
+.env
 CLAUDE.md
 .claude/

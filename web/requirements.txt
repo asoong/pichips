@@ -1,0 +1,8 @@
+# Streamlit debug app dependencies
+# Install from project root: pip install -r web/requirements.txt
+
+streamlit
+ultralytics
+opencv-python
+numpy
+python-dotenv
