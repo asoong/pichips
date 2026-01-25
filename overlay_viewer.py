@@ -1,203 +1,363 @@
+import os
 import cv2
 import numpy as np
-import onnxruntime as ort
+import torch
 from pathlib import Path
-from collections import Counter
+from collections import defaultdict
+from threading import Thread
+from queue import Queue
 
-STREAM_URL = "tcp://pichip.local:8888"
-MODEL_PATH = Path("./chips_yolo11.onnx")
+from dotenv import load_dotenv
+from mobile_sam import sam_model_registry, SamPredictor
 
-IMGSZ = 640
-CONF = 0.25
-IOU_THRESH = 0.45
+load_dotenv()
 
-# Chip configuration: class_id -> {name, value, color (BGR)}
-CHIP_CONFIG = {
-    0: {"name": "white", "value": 1, "color": (255, 255, 255)},
-    1: {"name": "red", "value": 5, "color": (0, 0, 255)},
-    2: {"name": "blue", "value": 10, "color": (255, 0, 0)},
-    3: {"name": "green", "value": 25, "color": (0, 255, 0)},
-    4: {"name": "black", "value": 100, "color": (50, 50, 50)},
+# Configuration from environment variables
+STREAM_URL = os.getenv("PICHIP_STREAM_URL", "tcp://pichip.local:8888")
+MOBILESAM_PATH = Path(os.getenv("PICHIP_MOBILESAM_PATH", "models/mobile_sam.pt"))
+SAM_INTERVAL = int(os.getenv("PICHIP_SAM_INTERVAL", "10"))
+MIN_REGION_AREA = int(os.getenv("PICHIP_MIN_REGION_AREA", "1000"))
+DEVICE_PREF = os.getenv("PICHIP_DEVICE", "auto")
+
+# Chip configuration - 4 types: white, red, blue, yellow
+CHIP_VALUES = {
+    "white": 1,
+    "red": 5,
+    "blue": 10,
+    "yellow": 25,
 }
 
-sess = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
-in_name = sess.get_inputs()[0].name
-out_names = [o.name for o in sess.get_outputs()]
+# HSV ranges for detecting chip colors
+CHIP_HSV_RANGES = {
+    "white": ((0, 0, 180), (180, 40, 255)),
+    "red": ((0, 120, 100), (10, 255, 255)),
+    "red2": ((165, 120, 100), (180, 255, 255)),
+    "blue": ((95, 100, 100), (125, 255, 255)),
+    "yellow": ((15, 100, 100), (35, 255, 255)),
+}
+
+# Display colors (BGR)
+CHIP_COLORS_BGR = {
+    "white": (255, 255, 255),
+    "red": (0, 0, 255),
+    "blue": (255, 0, 0),
+    "yellow": (0, 255, 255),
+}
 
 
-def preprocess(bgr):
-    """Preprocess frame for YOLO11 inference."""
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    h, w = rgb.shape[:2]
-    resized = cv2.resize(rgb, (IMGSZ, IMGSZ))
-    x = resized.astype(np.float32) / 255.0
-    x = np.transpose(x, (2, 0, 1))[None, ...]
-    return x, (h, w)
+class VideoCapture:
+    """Threaded video capture to avoid blocking."""
+
+    def __init__(self, src):
+        self.cap = cv2.VideoCapture(src)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.q = Queue(maxsize=2)
+        self.stopped = False
+        self.thread = Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self):
+        while not self.stopped:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+            if not self.q.full():
+                self.q.put(frame)
+            else:
+                try:
+                    self.q.get_nowait()
+                    self.q.put(frame)
+                except:
+                    pass
+
+    def read(self):
+        if self.q.empty():
+            return None
+        return self.q.get()
+
+    def release(self):
+        self.stopped = True
+        self.cap.release()
 
 
-def postprocess(outputs, orig_hw):
-    """Process YOLO11 detection outputs.
+def find_chip_regions(frame):
+    """Find chip regions using color detection. Returns center points and colors."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    regions = []
 
-    YOLO11 output format: [1, 4+num_classes, num_predictions]
-    - First 4 values: x_center, y_center, width, height
-    - Remaining values: class scores
-    """
-    preds = outputs[0]  # Shape: [1, 84, 8400]
-
-    # Transpose to [num_predictions, features]
-    preds = preds[0].T  # Shape: [8400, 84]
-
-    h, w = orig_hw
-    sx, sy = w / IMGSZ, h / IMGSZ
-
-    boxes = []
-    scores = []
-    class_ids = []
-
-    for pred in preds:
-        # Extract bbox: x_center, y_center, width, height
-        x_c, y_c, bw, bh = pred[:4]
-
-        # Extract class scores and find best class
-        class_scores = pred[4:]
-        cls_id = np.argmax(class_scores)
-        conf = class_scores[cls_id]
-
-        if conf < CONF:
+    for color_name, (lower, upper) in CHIP_HSV_RANGES.items():
+        if color_name == "red2":
             continue
 
-        # Only process chip classes (0-4)
-        if cls_id not in CHIP_CONFIG:
-            continue
+        mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
 
-        # Convert center coords to corner coords and scale
-        x1 = (x_c - bw / 2) * sx
-        y1 = (y_c - bh / 2) * sy
-        x2 = (x_c + bw / 2) * sx
-        y2 = (y_c + bh / 2) * sy
+        # Combine red ranges
+        if color_name == "red":
+            lower2, upper2 = CHIP_HSV_RANGES["red2"]
+            mask2 = cv2.inRange(hsv, np.array(lower2), np.array(upper2))
+            mask = cv2.bitwise_or(mask, mask2)
 
-        boxes.append([x1, y1, x2, y2])
-        scores.append(conf)
-        class_ids.append(cls_id)
+        # Clean up
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-    if not boxes:
-        return []
+        # Find contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Apply NMS
-    boxes_np = np.array(boxes, dtype=np.float32)
-    scores_np = np.array(scores, dtype=np.float32)
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < MIN_REGION_AREA:
+                continue
 
-    indices = cv2.dnn.NMSBoxes(
-        boxes_np.tolist(), scores_np.tolist(), CONF, IOU_THRESH
-    )
+            # Get center point for SAM prompt
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
 
-    dets = []
-    if len(indices) > 0:
-        indices = indices.flatten()
-        for i in indices:
-            dets.append({
-                "bbox": boxes[i],
-                "conf": float(scores[i]),
-                "cls": int(class_ids[i]),
+            x, y, w, h = cv2.boundingRect(contour)
+
+            regions.append({
+                "center": (cx, cy),
+                "bbox": (x, y, w, h),
+                "color": color_name,
+                "area": area,
             })
 
-    return dets
+    return regions
 
 
-def count_chips(dets):
-    """Count chips by type and calculate total value."""
-    counts = Counter([d["cls"] for d in dets])
+def segment_with_sam(predictor, frame_rgb, regions):
+    """Use SAM to get precise masks for each detected region."""
+    predictor.set_image(frame_rgb)
+
+    segmented = []
+
+    for region in regions:
+        cx, cy = region["center"]
+
+        # Use point prompt
+        point_coords = np.array([[cx, cy]])
+        point_labels = np.array([1])  # 1 = foreground
+
+        masks, scores, _ = predictor.predict(
+            point_coords=point_coords,
+            point_labels=point_labels,
+            multimask_output=True,
+        )
+
+        # Take the mask with highest score
+        best_idx = np.argmax(scores)
+        mask = masks[best_idx]
+
+        # Get bounding box of mask
+        coords = np.column_stack(np.where(mask))
+        if len(coords) == 0:
+            continue
+
+        y_min, x_min = coords.min(axis=0)
+        y_max, x_max = coords.max(axis=0)
+
+        segmented.append({
+            "mask": mask,
+            "bbox": (x_min, y_min, x_max - x_min, y_max - y_min),
+            "color": region["color"],
+            "score": scores[best_idx],
+        })
+
+    return segmented
+
+
+def count_chips_in_segment(mask, frame_gray):
+    """Count individual chips in a segmented region using edge detection."""
+    # Get bounding box
+    coords = np.column_stack(np.where(mask))
+    if len(coords) == 0:
+        return 1
+
+    y_min, x_min = coords.min(axis=0)
+    y_max, x_max = coords.max(axis=0)
+
+    w = x_max - x_min
+    h = y_max - y_min
+
+    if w == 0 or h == 0:
+        return 1
+
+    # Extract ROI
+    roi = frame_gray[y_min:y_max, x_min:x_max].copy()
+    roi_mask = mask[y_min:y_max, x_min:x_max].astype(np.uint8)
+
+    # Apply mask
+    roi = cv2.bitwise_and(roi, roi, mask=roi_mask)
+
+    # Edge detection
+    edges = cv2.Canny(roi, 30, 100)
+    edges = cv2.bitwise_and(edges, edges, mask=roi_mask)
+
+    # Determine orientation - horizontal or vertical stack
+    is_horizontal = w > h
+
+    if is_horizontal:
+        # Project edges vertically
+        profile = np.sum(edges, axis=0).astype(np.float32)
+    else:
+        # Project edges horizontally
+        profile = np.sum(edges, axis=1).astype(np.float32)
+
+    if len(profile) == 0 or np.max(profile) == 0:
+        return 1
+
+    # Smooth
+    k = max(3, len(profile) // 30)
+    if k % 2 == 0:
+        k += 1
+    profile = cv2.GaussianBlur(profile.reshape(1, -1), (k, 1), 0).flatten()
+
+    # Count peaks
+    threshold = np.max(profile) * 0.3
+    above = profile > threshold
+    crossings = np.diff(above.astype(int))
+    num_peaks = np.sum(crossings == 1)
+
+    # Each chip typically has 1-2 edge lines
+    chip_count = max(1, (num_peaks + 1) // 2)
+
+    # Sanity bounds
+    length = w if is_horizontal else h
+    min_chips = max(1, length // 25)  # Max 25px per chip
+    max_chips = length // 4  # Min 4px per chip
+
+    return max(min_chips, min(chip_count, max_chips))
+
+
+def draw_visualization(frame, segments, chip_counts):
+    """Draw segmentation masks, labels, and HUD."""
+    vis = frame.copy()
+
+    # Draw each segment
+    for seg in segments:
+        mask = seg["mask"]
+        color = seg["color"]
+        count = seg.get("count", 0)
+        x, y, w, h = seg["bbox"]
+        bgr = CHIP_COLORS_BGR.get(color, (0, 255, 0))
+
+        # Draw semi-transparent mask
+        overlay = vis.copy()
+        overlay[mask] = bgr
+        cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
+
+        # Draw contour
+        contours, _ = cv2.findContours(
+            mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(vis, contours, -1, bgr, 2)
+
+        # Draw label
+        label = f"{color}: {count}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        label_x, label_y = x, max(y - 5, th + 5)
+        cv2.rectangle(vis, (label_x, label_y - th - 4), (label_x + tw + 4, label_y + 2), (0, 0, 0), -1)
+        cv2.putText(vis, label, (label_x + 2, label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    # Draw HUD
     total_value = sum(
-        count * CHIP_CONFIG[cls]["value"]
-        for cls, count in counts.items()
-        if cls in CHIP_CONFIG
+        count * CHIP_VALUES.get(color, 0)
+        for color, count in chip_counts.items()
     )
-    return counts, total_value
 
+    overlay = vis.copy()
+    cv2.rectangle(overlay, (5, 5), (170, 145), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.7, vis, 0.3, 0, vis)
 
-def draw_boxes(frame, dets):
-    """Draw bounding boxes with chip colors."""
-    for d in dets:
-        x1, y1, x2, y2 = map(int, d["bbox"])
-        conf = d["conf"]
-        cls = d["cls"]
-
-        config = CHIP_CONFIG.get(cls, {"name": str(cls), "color": (0, 255, 0)})
-        color = config["color"]
-        label = f"{config['name']} {conf:.2f}"
-
-        # Draw box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-        # Draw label background
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(frame, (x1, y1 - th - 4), (x1 + tw, y1), color, -1)
-
-        # Draw label text (black for light colors, white for dark)
-        text_color = (0, 0, 0) if cls in [0, 3] else (255, 255, 255)
-        cv2.putText(frame, label, (x1, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
-
-    return frame
-
-
-def draw_hud(frame, counts, total_value):
-    """Draw chip counts and total value on screen."""
-    # Draw semi-transparent background
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (5, 5), (150, 160), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-
-    y = 25
-    cv2.putText(frame, "Chip Count:", (10, y),
+    y_pos = 25
+    cv2.putText(vis, "Chip Counts:", (10, y_pos),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    y += 20
+    y_pos += 24
 
-    # Show counts for each chip type
-    for cls in sorted(CHIP_CONFIG.keys()):
-        config = CHIP_CONFIG[cls]
-        count = counts.get(cls, 0)
-        text = f"{config['name']}: {count}"
-        color = config["color"]
-        # Make white text visible
-        if cls == 0:
-            color = (200, 200, 200)
-        cv2.putText(frame, text, (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-        y += 18
+    for color in ["white", "red", "blue", "yellow"]:
+        count = chip_counts.get(color, 0)
+        value = count * CHIP_VALUES.get(color, 0)
+        text = f"{color}: {count} (${value})"
+        bgr = CHIP_COLORS_BGR.get(color, (255, 255, 255))
+        cv2.putText(vis, text, (15, y_pos),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, bgr, 1)
+        y_pos += 22
 
-    # Draw total value
-    y += 5
-    cv2.putText(frame, f"Total: ${total_value}", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    y_pos += 5
+    cv2.putText(vis, f"Total: ${total_value}", (10, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
-    return frame
+    return vis
+
+
+def get_device():
+    """Select compute device based on preference and availability."""
+    if DEVICE_PREF != "auto":
+        return DEVICE_PREF
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def main():
-    cap = cv2.VideoCapture(STREAM_URL)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open stream: {STREAM_URL}")
+    # Load MobileSAM
+    device = get_device()
+    print(f"Loading MobileSAM on {device}...")
 
-    print("PiChip Viewer - Press 'q' to quit")
+    sam = sam_model_registry["vit_t"](checkpoint=str(MOBILESAM_PATH))
+    sam.to(device)
+    sam.eval()
+    predictor = SamPredictor(sam)
+
+    print("Starting video capture...")
+    cap = VideoCapture(STREAM_URL)
+
+    print("PiChip Viewer (MobileSAM) - Press 'q' to quit")
+
+    frame_count = 0
+    cached_segments = []
+    cached_counts = defaultdict(int)
 
     while True:
-        ret, frame = cap.read()
-        if not ret or frame is None:
+        frame = cap.read()
+        if frame is None:
             continue
 
-        # Run inference
-        x, orig_hw = preprocess(frame)
-        outputs = sess.run(out_names, {in_name: x})
-        dets = postprocess(outputs, orig_hw)
+        frame_count += 1
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Count chips and calculate value
-        counts, total_value = count_chips(dets)
+        # Run detection + SAM periodically
+        if frame_count % SAM_INTERVAL == 1 or not cached_segments:
+            # Step 1: Find chip regions by color
+            regions = find_chip_regions(frame)
 
-        # Draw visualization
-        vis = draw_boxes(frame, dets)
-        vis = draw_hud(vis, counts, total_value)
+            # Step 2: Segment with SAM
+            if regions:
+                with torch.no_grad():
+                    segments = segment_with_sam(predictor, frame_rgb, regions)
+            else:
+                segments = []
 
+            # Step 3: Count chips in each segment
+            chip_counts = defaultdict(int)
+            for seg in segments:
+                count = count_chips_in_segment(seg["mask"], frame_gray)
+                seg["count"] = count
+                chip_counts[seg["color"]] += count
+
+            cached_segments = segments
+            cached_counts = chip_counts
+
+        # Draw
+        vis = draw_visualization(frame, cached_segments, cached_counts)
         cv2.imshow("PiChip Viewer", vis)
 
         if (cv2.waitKey(1) & 0xFF) == ord("q"):
