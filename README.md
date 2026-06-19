@@ -1,112 +1,179 @@
 # PiChip Viewer
 
-Real-time poker chip stack detection, counting, and value calculation using a **custom
-YOLO detector** trained on synthetic data from the Raya Labs PiChip pipeline. Designed to
-work with a Raspberry Pi video stream.
+Real-time poker-chip detection, counting, and value calculation using a **custom YOLO
+detector** trained on synthetic data from the Raya Labs PiChip pipeline. The detector runs
+**on a Raspberry Pi** reading its camera directly, and you can watch the annotated feed in a
+browser on another machine (or on a monitor plugged into the Pi).
 
-## Features
+> See **[README.html](README.html)** for a visual architecture diagram, and
+> **[TRAINING.md](TRAINING.md)** for the end-to-end runbook (including how many images to use).
 
-- **Custom YOLO detector**: color (white/red/blue/yellow) and orientation (face/edge) come
-  straight from a model you train — no fragile HSV color guessing
-- **Edge-based counting**: counts individual chips in side-lying stacks via Canny edge
-  detection
-- **Real-time display**: OpenCV window with detection boxes and value HUD
+## How it works
 
-## End-to-end pipeline
-
-This repo is the **training + inference** end of the PiChip pipeline. The full loop is
-documented in **[TRAINING.md](TRAINING.md)** (includes how many images to use):
+The system spans three places:
 
 ```
-PiChip web client:  generate synthetic images → segment/curate → export dataset.zip
-        │
-        ▼
-pichip_viewer:  train.py  →  models/pichip_detector.pt  →  overlay_viewer.py
+┌─────────────── Raya Labs PiChip web client ───────────────┐
+│ generate synthetic images (Gemini) → segment/label (SAM3) │
+│ → curate masks → export dataset.zip (YOLO format) to S3   │
+└────────────────────────────┬──────────────────────────────┘
+                             │  download dataset.zip
+                             ▼
+┌──────────────────── Your Mac — training ──────────────────┐
+│ train.py (Ultralytics, MPS) → models/pichip_detector.pt   │
+└────────────────────────────┬──────────────────────────────┘
+                             │  scp the .pt to the Pi
+                             ▼
+┌──────────────── Raspberry Pi — live inference ────────────┐
+│ CSI camera (picamera2) → overlay_viewer.py:               │
+│   YOLO/ONNX detect → color + face/edge per chip           │
+│   → edge-count side-lying stacks → value HUD              │
+│   → MJPEG server on :8090                                  │
+└───────┬───────────────────────────────────┬───────────────┘
+        │ MJPEG over HTTP                    │ HDMI
+        ▼                                    ▼
+   Mac browser                          Monitor on the Pi
+ http://pichip.local:8090/              (live window)
 ```
 
-## Project Structure
+1. **Detection** — the trained YOLO model localizes each chip and labels it
+   `<color>_<face|edge>` (color ∈ white/red/blue/yellow). Class names are embedded in the
+   weights, so the viewer reads them via `model.names` and never hardcodes a list.
+2. **Counting** — a face-on chip counts as 1; a side-lying *stack* (one `edge` detection) is
+   counted with Canny edges + peak detection.
+3. **Output** — boxes + per-chip counts + a running value HUD, shown in a local window and/or
+   served as an MJPEG HTTP stream.
+
+## Project structure
 
 ```
 pichip_viewer/
-├── overlay_viewer.py      # Main viewer (loads the custom YOLO detector)
-├── train.py               # Train a detector from an exported dataset
-├── TRAINING.md            # End-to-end runbook (generate → train → run)
-├── models/                # Model weights (gitignored)
-│   └── pichip_detector.pt # Your trained detector (produced by train.py)
-├── web/                   # Streamlit debug/experimentation app
-│   ├── app.py
-│   └── requirements.txt
+├── overlay_viewer.py   # Main viewer: camera → detector → HUD → (window | MJPEG)
+├── train.py            # Train a detector from an exported dataset (run on the Mac)
+├── deploy_model.sh     # On the Pi: export a trained .pt → ONNX + point .env at it
+├── run.sh              # On the Pi: launch the viewer using the venv + .env
+├── TRAINING.md         # End-to-end runbook (generate → train → run)
+├── README.html         # Architecture diagram (open in a browser)
+├── models/             # Model weights (gitignored)
+├── web/                # Streamlit debug app (YOLO-World / experimentation)
 ├── .env.example
 └── requirements.txt
 ```
 
-## Quick Start
+## Setup
 
-### 1. Setup
+### On the Raspberry Pi (where inference runs)
+
+Requires a Pi with a CSI camera and 64-bit Raspberry Pi OS / Debian. `picamera2` must be
+available at the system level (preinstalled on Raspberry Pi OS, else `sudo apt install -y
+python3-picamera2`).
 
 ```bash
 git clone <repo-url> pichip_viewer
 cd pichip_viewer
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+
+# --system-site-packages so the venv can see the system picamera2 / libcamera
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+
+# IMPORTANT: install CPU-only torch from the CPU index — the default pulls ~1.3 GB of
+# unused CUDA wheels on ARM.
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install ultralytics opencv-python
+
+cp .env.example .env        # defaults already target the Pi camera + MJPEG stream
 ```
 
-### 2. Get a model
-
-Train one from a PiChip training-set export (see **[TRAINING.md](TRAINING.md)**):
+### On your Mac (where training runs)
 
 ```bash
-python train.py --dataset datasets/<token> --model yolo26n.pt \
+pip install ultralytics      # pulls an MPS-capable torch on macOS
+```
+
+## Commands
+
+### 1. Train (on the Mac)
+
+After exporting a training set from the web client (see [TRAINING.md](TRAINING.md)):
+
+```bash
+python train.py --dataset datasets/<token> --model yolo11n.pt \
   --epochs 100 --imgsz 1024 --batch 16 --device mps
-# writes models/pichip_detector.pt
+# → models/pichip_detector.pt   (yolo26n.pt also supported)
 ```
 
-### 3. Configure & run
+### 2. Deploy to the Pi
 
 ```bash
-cp .env.example .env       # set PICHIP_STREAM_URL to your Pi's address
-python overlay_viewer.py
+# from the Mac
+scp models/pichip_detector.pt <pi-user>@pichip.local:~/pichip_viewer/models/
+
+# on the Pi
+./deploy_model.sh    # exports models/pichip_detector.onnx (faster) + updates .env
 ```
 
-Press `q` to quit.
+### 3. Run on the Pi
 
-## Environment Variables
+```bash
+./run.sh
+```
+- **Over SSH (headless):** prints running chip counts; the MJPEG stream stays live.
+- **On a monitor attached to the Pi:** shows the live annotated window (press `q` to quit).
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PICHIP_STREAM_URL` | `tcp://pichip.local:8888` | Raspberry Pi video stream URL |
-| `PICHIP_DETECTOR_PATH` | `models/pichip_detector.pt` | Trained detector loaded by the viewer |
-| `PICHIP_YOLO_PATH` | `models/pichip_detector.pt` | Model for the Streamlit app (a `*-worldv2.pt` enables YOLO-World mode) |
-| `PICHIP_DETECT_INTERVAL` | `5` | Run detection every N frames |
-| `PICHIP_CONFIDENCE` | `0.3` | Detection confidence threshold |
-| `PICHIP_DEVICE` | `auto` | Compute device: `auto`, `cuda`, `mps`, `cpu` |
+### 4. Watch from your Mac
 
-## Streamlit Debug App
+With the viewer running on the Pi, open in a browser:
 
-A separate web UI for experimentation. By default it loads the same custom detector; point
-`PICHIP_YOLO_PATH` at a `yolov8s-worldv2.pt` to fall back to open-vocab YOLO-World.
+```
+http://pichip.local:8090/
+```
+(Also works in VLC: *Open Network Stream* → that URL. Off-network, tunnel it:
+`ssh -L 8090:localhost:8090 <pi-user>@pichip.local` then open `http://localhost:8090/`.)
+
+### Self-test before you have a trained model
+
+A stock model is handy for checking the camera + stream end-to-end:
+
+```bash
+PICHIP_DETECTOR_PATH=yolo11n.onnx ./run.sh   # then open the URL (it just won't count chips)
+```
+
+### Streamlit debug app (optional)
 
 ```bash
 pip install -r web/requirements.txt
-cd web
-streamlit run app.py
+cd web && streamlit run app.py
 ```
+Loads the custom detector by default; point `PICHIP_YOLO_PATH` at a `*-worldv2.pt` for
+open-vocab YOLO-World mode instead.
 
-## Architecture
+## Environment variables
 
-```
-Video Stream (Pi) -> Custom YOLO detector -> per-class boxes (color + face/edge)
-                  -> edge-count each side-lying stack -> value HUD
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PICHIP_SOURCE` | auto | `picamera2` (Pi camera) or `stream` (TCP). Auto-detects the Pi camera. |
+| `PICHIP_DETECTOR_PATH` | `models/pichip_detector.pt` | Detector loaded by the viewer (`.pt` or ONNX) |
+| `PICHIP_MJPEG_PORT` | `8090` | Serve the annotated feed at `http://<pi>:<port>/` (0 = off) |
+| `PICHIP_DEVICE` | `auto` | `auto`, `cpu`, `cuda`, `mps` (use `cpu` on the Pi) |
+| `PICHIP_DETECT_INTERVAL` | `5` | Run detection every N frames |
+| `PICHIP_CONFIDENCE` | `0.3` | Detection confidence threshold |
+| `PICHIP_CAMERA_WIDTH` / `PICHIP_CAMERA_HEIGHT` | `1280` / `720` | picamera2 capture size |
+| `PICHIP_CAMERA_SWAP_RB` | `0` | Set `1` if camera colors look red/blue-swapped |
+| `PICHIP_HEADLESS` | auto | Force no-window mode (auto-on when there's no display) |
+| `PICHIP_STREAM_URL` | `tcp://pichip.local:8888` | Remote TCP source, used only when `PICHIP_SOURCE=stream` |
 
-1. **Detection**: the trained YOLO model localizes chips and labels each as
-   `<color>_<face|edge>`.
-2. **Counting**: face detections count as 1; edge (side-lying stack) detections are
-   counted via Canny edges + peak detection.
-3. **Visualization**: overlay boxes, per-detection counts, and the value HUD.
+## Performance notes (Raspberry Pi 4, CPU)
 
-## Chip Configuration
+| Runtime | Speed | Notes |
+|---------|-------|-------|
+| PyTorch `.pt` @640 | ~1.3 fps | works, but slow |
+| **ONNX @640** | **~2.2 fps** | recommended — what `deploy_model.sh` produces |
+| NCNN | — | segfaults on this aarch64 / Python 3.13 build; not used |
+
+~2 fps is fine for a mostly-static chip tray. Lower `PICHIP_CONFIDENCE` or retrain with more
+data if detection is weak (see TRAINING.md).
+
+## Chip values
 
 | Color | Value |
 |-------|-------|
@@ -115,16 +182,4 @@ Video Stream (Pi) -> Custom YOLO detector -> per-class boxes (color + face/edge)
 | Blue | $10 |
 | Yellow | $25 |
 
-Adjust values live in the Streamlit sidebar, or edit `CHIP_VALUES` in the source.
-
-## Hardware Requirements
-
-- **Video Source**: Raspberry Pi with camera streaming via TCP (e.g., FFmpeg)
-- **Compute**: Apple Silicon (MPS) recommended on Mac; NVIDIA GPU (CUDA) for best
-  performance; CPU works but is slower.
-
-## Tuning
-
-- `PICHIP_DETECT_INTERVAL`: increase for higher FPS, decrease for more responsive updates.
-- `PICHIP_CONFIDENCE`: raise to drop low-confidence detections.
-- Retrain with more data (see TRAINING.md) if detection/counting is weak on real chips.
+Edit `CHIP_VALUES` in `overlay_viewer.py` (or the Streamlit sidebar) to change these.

@@ -9,6 +9,8 @@ models/*.pt
 models/*.onnx
 models/*.pth
 
+TRAINING.*
+
 # Environment
 .env
 CLAUDE.md

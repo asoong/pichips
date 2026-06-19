@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PiChip Viewer — Architecture</title>
+    <style>
+      :root {
+        --bg: #f7f7f8; --card: #ffffff; --ink: #1c1d21; --muted: #6b6f76;
+        --line: #e4e6ea; --accent: #2f6df6; --code-bg: #0f1117; --code-ink: #e7ebf3;
+        --web: #6366f1; --mac: #2f6df6; --pi: #e0457b; --out: #16a34a;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #15161a; --card: #1c1e24; --ink: #e8eaed; --muted: #9aa0a8;
+          --line: #2c2f37; --accent: #6ea0ff; --code-bg: #0c0e13; --code-ink: #e7ebf3;
+          --web: #8b8df5; --mac: #6ea0ff; --pi: #f06595; --out: #4ade80;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; background: var(--bg); color: var(--ink);
+        font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      }
+      .wrap { max-width: 940px; margin: 0 auto; padding: 40px 22px 80px; }
+      h1 { font-size: 29px; margin: 0 0 6px; letter-spacing: -0.02em; }
+      .subtitle { color: var(--muted); margin: 0 0 28px; }
+      h2 { font-size: 20px; margin: 38px 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+      p { margin: 12px 0; }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.85em; background: rgba(127,127,127,0.14); padding: 1px 5px; border-radius: 5px;
+      }
+      pre {
+        background: var(--code-bg); color: var(--code-ink); border-radius: 10px;
+        padding: 15px 18px; overflow-x: auto; font-size: 13.5px; line-height: 1.55;
+      }
+      pre code { background: none; padding: 0; }
+      .diagram { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 18px; margin: 18px 0; }
+      .diagram svg { width: 100%; height: auto; display: block; }
+      .legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 14px 2px 0; font-size: 13.5px; color: var(--muted); }
+      .legend span { display: inline-flex; align-items: center; gap: 7px; }
+      .dot { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+      .steps { padding-left: 0; list-style: none; }
+      .steps li { margin: 10px 0; padding-left: 30px; position: relative; }
+      .steps li b.n {
+        position: absolute; left: 0; top: 1px; width: 21px; height: 21px; border-radius: 50%;
+        background: var(--accent); color: #fff; font-size: 12px; font-weight: 700;
+        display: inline-flex; align-items: center; justify-content: center;
+      }
+      /* SVG theming */
+      .s-box { fill: var(--card); stroke: var(--line); stroke-width: 1.5; }
+      .s-web { fill: color-mix(in srgb, var(--web) 13%, transparent); stroke: var(--web); stroke-width: 1.5; }
+      .s-mac { fill: color-mix(in srgb, var(--mac) 13%, transparent); stroke: var(--mac); stroke-width: 1.5; }
+      .s-pi  { fill: color-mix(in srgb, var(--pi) 9%, transparent);  stroke: var(--pi);  stroke-width: 1.5; }
+      .s-inner { fill: var(--card); stroke: var(--pi); stroke-width: 1.2; }
+      .s-out { fill: color-mix(in srgb, var(--out) 13%, transparent); stroke: var(--out); stroke-width: 1.5; }
+      .t { fill: var(--ink); font-family: inherit; }
+      .t-title { font-weight: 700; font-size: 14px; }
+      .t-sub { fill: var(--muted); font-size: 11.5px; }
+      .t-small { fill: var(--ink); font-size: 11.5px; font-weight: 600; }
+      .t-lbl { fill: var(--muted); font-size: 11px; font-style: italic; }
+      .arrow { stroke: var(--muted); stroke-width: 1.6; fill: none; }
+      .arrowhead { fill: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>PiChip Viewer — Architecture</h1>
+      <p class="subtitle">
+        How synthetic-data training, the Raspberry Pi, and your Mac all connect to count
+        poker chips in real time.
+      </p>
+
+      <div class="diagram">
+        <svg viewBox="0 0 860 660" role="img" aria-label="PiChip system architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+              <path d="M0,0 L7,3 L0,6 Z" class="arrowhead" />
+            </marker>
+          </defs>
+
+          <!-- 1. Web client -->
+          <rect class="s-web" x="180" y="16" width="500" height="72" rx="12" />
+          <text class="t t-title" x="430" y="44" text-anchor="middle">Raya Labs PiChip Web Client</text>
+          <text class="t-sub" x="430" y="66" text-anchor="middle">generate (Gemini) · segment + label (SAM3) · curate · export dataset.zip</text>
+
+          <!-- arrow 1 -->
+          <line class="arrow" x1="430" y1="88" x2="430" y2="118" marker-end="url(#ah)" />
+          <text class="t-lbl" x="442" y="107">dataset.zip (YOLO format, from S3)</text>
+
+          <!-- 2. Mac training -->
+          <rect class="s-mac" x="210" y="120" width="440" height="72" rx="12" />
+          <text class="t t-title" x="430" y="148" text-anchor="middle">Your Mac — Training</text>
+          <text class="t-sub" x="430" y="170" text-anchor="middle">train.py (Ultralytics · MPS) → models/pichip_detector.pt</text>
+
+          <!-- arrow 2 -->
+          <line class="arrow" x1="430" y1="192" x2="430" y2="224" marker-end="url(#ah)" />
+          <text class="t-lbl" x="442" y="212">scp the .pt → deploy_model.sh exports ONNX</text>
+
+          <!-- 3. Raspberry Pi -->
+          <rect class="s-pi" x="40" y="226" width="780" height="184" rx="14" />
+          <text class="t t-title" x="60" y="252">Raspberry Pi — Live Inference (overlay_viewer.py)</text>
+
+          <!-- inner pipeline boxes -->
+          <g>
+            <rect class="s-inner" x="60"  y="300" width="128" height="64" rx="9" />
+            <text class="t-small" x="124" y="328" text-anchor="middle">Camera Mod 3</text>
+            <text class="t-sub"   x="124" y="346" text-anchor="middle">imx708 / CSI</text>
+
+            <rect class="s-inner" x="213" y="300" width="128" height="64" rx="9" />
+            <text class="t-small" x="277" y="328" text-anchor="middle">picamera2</text>
+            <text class="t-sub"   x="277" y="346" text-anchor="middle">BGR frames</text>
+
+            <rect class="s-inner" x="366" y="300" width="128" height="64" rx="9" />
+            <text class="t-small" x="430" y="328" text-anchor="middle">YOLO detector</text>
+            <text class="t-sub"   x="430" y="346" text-anchor="middle">ONNX · CPU</text>
+
+            <rect class="s-inner" x="519" y="300" width="128" height="64" rx="9" />
+            <text class="t-small" x="583" y="324" text-anchor="middle">count + value</text>
+            <text class="t-sub"   x="583" y="342" text-anchor="middle">edge-count</text>
+            <text class="t-sub"   x="583" y="356" text-anchor="middle">stacks · HUD</text>
+
+            <rect class="s-inner" x="672" y="300" width="128" height="64" rx="9" />
+            <text class="t-small" x="736" y="328" text-anchor="middle">MJPEG server</text>
+            <text class="t-sub"   x="736" y="346" text-anchor="middle">port 8090</text>
+
+            <!-- inner arrows -->
+            <line class="arrow" x1="188" y1="332" x2="211" y2="332" marker-end="url(#ah)" />
+            <line class="arrow" x1="341" y1="332" x2="364" y2="332" marker-end="url(#ah)" />
+            <line class="arrow" x1="494" y1="332" x2="517" y2="332" marker-end="url(#ah)" />
+            <line class="arrow" x1="647" y1="332" x2="670" y2="332" marker-end="url(#ah)" />
+          </g>
+
+          <!-- arrows out to outputs -->
+          <path class="arrow" d="M250,410 C250,480 250,500 265,556" marker-end="url(#ah)" />
+          <text class="t-lbl" x="120" y="490">MJPEG over HTTP</text>
+
+          <path class="arrow" d="M605,410 L605,556" marker-end="url(#ah)" />
+          <text class="t-lbl" x="615" y="490">HDMI</text>
+
+          <!-- 4 + 5 outputs -->
+          <rect class="s-out" x="120" y="558" width="290" height="76" rx="12" />
+          <text class="t t-title" x="265" y="588" text-anchor="middle">Your Mac — Browser</text>
+          <text class="t-sub" x="265" y="610" text-anchor="middle">http://pichip.local:8090/</text>
+
+          <rect class="s-out" x="470" y="558" width="270" height="76" rx="12" />
+          <text class="t t-title" x="605" y="588" text-anchor="middle">Monitor on the Pi</text>
+          <text class="t-sub" x="605" y="610" text-anchor="middle">live annotated window</text>
+        </svg>
+
+        <div class="legend">
+          <span><i class="dot" style="background:var(--web)"></i> Web client (cloud)</span>
+          <span><i class="dot" style="background:var(--mac)"></i> Your Mac</span>
+          <span><i class="dot" style="background:var(--pi)"></i> Raspberry Pi</span>
+          <span><i class="dot" style="background:var(--out)"></i> Where you watch</span>
+        </div>
+      </div>
+
+      <h2>What happens at each stage</h2>
+      <ol class="steps">
+        <li><b class="n">1</b><b>Web client</b> — generate synthetic chip images, segment + label them into 9 classes (<code>&lt;color&gt;_&lt;face|edge&gt;</code>), curate, and export a YOLO-format <code>dataset.zip</code>.</li>
+        <li><b class="n">2</b><b>Mac</b> — <code>train.py</code> fine-tunes a YOLO model on that dataset (Apple-Silicon MPS) and writes <code>models/pichip_detector.pt</code>. The class names are baked into the weights.</li>
+        <li><b class="n">3</b><b>Pi</b> — <code>deploy_model.sh</code> exports the model to ONNX (~1.7× faster on the Pi CPU). <code>overlay_viewer.py</code> grabs camera frames via <strong>picamera2</strong>, runs detection, derives color + orientation from the class names, edge-counts side-lying stacks, and draws the value HUD.</li>
+        <li><b class="n">4</b><b>Watch it</b> — the annotated frames are served as an <strong>MJPEG HTTP stream</strong> on port 8090 (open in a browser on your Mac) and/or shown in a window on a monitor plugged into the Pi.</li>
+      </ol>
+
+      <h2>Commands</h2>
+      <pre><code># 1) Train (Mac), after exporting a dataset from the web client
+python train.py --dataset datasets/&lt;token&gt; --model yolo11n.pt \
+  --epochs 100 --imgsz 1024 --batch 16 --device mps
+
+# 2) Deploy to the Pi
+scp models/pichip_detector.pt &lt;pi-user&gt;@pichip.local:~/pichip_viewer/models/
+ssh &lt;pi-user&gt;@pichip.local 'cd ~/pichip_viewer && ./deploy_model.sh'
+
+# 3) Run on the Pi (headless over SSH, or a window on an attached monitor)
+ssh &lt;pi-user&gt;@pichip.local 'cd ~/pichip_viewer && ./run.sh'
+
+# 4) Watch from your Mac — open in a browser:
+#    http://pichip.local:8090/</code></pre>
+
+      <p style="color:var(--muted);font-size:14px;">
+        Full setup, env vars, and performance notes are in
+        <a href="README.md">README.md</a>; the end-to-end runbook (incl. how many training
+        images to use) is in <a href="TRAINING.md">TRAINING.md</a>.
+      </p>
+    </div>
+  </body>
+</html>

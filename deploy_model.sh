@@ -3,7 +3,7 @@
 #
 # Workflow:
 #   1) On your Mac, after training (train.py produces models/pichip_detector.pt):
-#        scp pichip_detector.pt asoong91@pichip.local:~/pichip_viewer/models/
+#        scp pichip_detector.pt <pi-user>@<pi-host>.local:~/pichip_viewer/models/
 #   2) On the Pi:
 #        ./deploy_model.sh        # exports ONNX (faster CPU inference) + points .env at it
 #        ./run.sh                 # start the viewer
