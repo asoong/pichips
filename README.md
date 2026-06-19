@@ -1,65 +1,71 @@
 # PiChip Viewer
 
-Real-time poker chip stack detection, counting, and value calculation using computer vision. Designed to work with a Raspberry Pi video stream.
+Real-time poker chip stack detection, counting, and value calculation using a **custom
+YOLO detector** trained on synthetic data from the Raya Labs PiChip pipeline. Designed to
+work with a Raspberry Pi video stream.
 
 ## Features
 
-- **MobileSAM Segmentation**: Precise chip stack segmentation using point prompts
-- **Edge-based Counting**: Counts individual chips in stacks via Canny edge detection
-- **HSV Color Classification**: Identifies chip colors (white, red, blue, yellow)
-- **Real-time Display**: OpenCV window with mask overlays and value HUD
+- **Custom YOLO detector**: color (white/red/blue/yellow) and orientation (face/edge) come
+  straight from a model you train — no fragile HSV color guessing
+- **Edge-based counting**: counts individual chips in side-lying stacks via Canny edge
+  detection
+- **Real-time display**: OpenCV window with detection boxes and value HUD
+
+## End-to-end pipeline
+
+This repo is the **training + inference** end of the PiChip pipeline. The full loop is
+documented in **[TRAINING.md](TRAINING.md)** (includes how many images to use):
+
+```
+PiChip web client:  generate synthetic images → segment/curate → export dataset.zip
+        │
+        ▼
+pichip_viewer:  train.py  →  models/pichip_detector.pt  →  overlay_viewer.py
+```
 
 ## Project Structure
 
 ```
 pichip_viewer/
-├── overlay_viewer.py      # Main viewer application
-├── models/                # Model weights (download separately)
-│   ├── mobile_sam.pt
-│   └── yolov8s-worldv2.pt
+├── overlay_viewer.py      # Main viewer (loads the custom YOLO detector)
+├── train.py               # Train a detector from an exported dataset
+├── TRAINING.md            # End-to-end runbook (generate → train → run)
+├── models/                # Model weights (gitignored)
+│   └── pichip_detector.pt # Your trained detector (produced by train.py)
 ├── web/                   # Streamlit debug/experimentation app
 │   ├── app.py
 │   └── requirements.txt
-├── .env.example           # Environment variable template
-└── requirements.txt       # Core dependencies
+├── .env.example
+└── requirements.txt
 ```
 
 ## Quick Start
 
-### 1. Clone and Setup Environment
+### 1. Setup
 
 ```bash
-git clone <repo-url>
+git clone <repo-url> pichip_viewer
 cd pichip_viewer
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Download Models
+### 2. Get a model
+
+Train one from a PiChip training-set export (see **[TRAINING.md](TRAINING.md)**):
 
 ```bash
-# Create models directory (if not exists)
-mkdir -p models
-
-# Download MobileSAM (~39MB) - required for main viewer
-wget -O models/mobile_sam.pt \
-  https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt
+python train.py --dataset datasets/<token> --model yolo26n.pt \
+  --epochs 100 --imgsz 1024 --batch 16 --device mps
+# writes models/pichip_detector.pt
 ```
 
-### 3. Configure Environment
+### 3. Configure & run
 
 ```bash
-# Copy example config
-cp .env.example .env
-
-# Edit .env with your settings
-# Most important: set PICHIP_STREAM_URL to your Pi's address
-```
-
-### 4. Run
-
-```bash
+cp .env.example .env       # set PICHIP_STREAM_URL to your Pi's address
 python overlay_viewer.py
 ```
 
@@ -70,71 +76,55 @@ Press `q` to quit.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PICHIP_STREAM_URL` | `tcp://pichip.local:8888` | Raspberry Pi video stream URL |
-| `PICHIP_MOBILESAM_PATH` | `models/mobile_sam.pt` | Path to MobileSAM weights |
-| `PICHIP_SAM_INTERVAL` | `10` | Run segmentation every N frames |
-| `PICHIP_MIN_REGION_AREA` | `1000` | Minimum pixel area for chip detection |
+| `PICHIP_DETECTOR_PATH` | `models/pichip_detector.pt` | Trained detector loaded by the viewer |
+| `PICHIP_YOLO_PATH` | `models/pichip_detector.pt` | Model for the Streamlit app (a `*-worldv2.pt` enables YOLO-World mode) |
+| `PICHIP_DETECT_INTERVAL` | `5` | Run detection every N frames |
+| `PICHIP_CONFIDENCE` | `0.3` | Detection confidence threshold |
 | `PICHIP_DEVICE` | `auto` | Compute device: `auto`, `cuda`, `mps`, `cpu` |
 
 ## Streamlit Debug App
 
-A separate web-based app for experimentation with YOLO-World detection.
-
-### Setup
+A separate web UI for experimentation. By default it loads the same custom detector; point
+`PICHIP_YOLO_PATH` at a `yolov8s-worldv2.pt` to fall back to open-vocab YOLO-World.
 
 ```bash
-# Install additional dependencies
 pip install -r web/requirements.txt
-
-# Download YOLO-World model (optional - auto-downloads on first run)
-python -c "from ultralytics import YOLO; YOLO('yolov8s-worldv2.pt')"
-mv yolov8s-worldv2.pt models/
-```
-
-### Run
-
-```bash
 cd web
 streamlit run app.py
 ```
 
-The web UI provides:
-- Adjustable confidence threshold
-- Editable chip values
-- Real-time count metrics
-
-## Hardware Requirements
-
-- **Video Source**: Raspberry Pi with camera streaming via TCP (e.g., using FFmpeg)
-- **Compute**:
-  - Apple Silicon (MPS): Recommended for Mac
-  - NVIDIA GPU (CUDA): Best performance
-  - CPU: Works but slower
-
-## Chip Configuration
-
-| Color | Value | HSV Range |
-|-------|-------|-----------|
-| White | $1 | Low saturation, high value |
-| Red | $5 | Hue 0-10, 165-180 |
-| Blue | $10 | Hue 95-125 |
-| Yellow | $25 | Hue 15-35 |
-
 ## Architecture
 
 ```
-Video Stream (Pi) -> Color Detection -> MobileSAM Segmentation -> Edge Counting -> Display
+Video Stream (Pi) -> Custom YOLO detector -> per-class boxes (color + face/edge)
+                  -> edge-count each side-lying stack -> value HUD
 ```
 
-1. **Color Detection**: HSV thresholding finds chip regions
-2. **MobileSAM**: Point prompts generate precise masks for each region
-3. **Edge Counting**: Canny edges + peak detection counts chips per stack
-4. **Visualization**: Overlay masks, contours, and value HUD
+1. **Detection**: the trained YOLO model localizes chips and labels each as
+   `<color>_<face|edge>`.
+2. **Counting**: face detections count as 1; edge (side-lying stack) detections are
+   counted via Canny edges + peak detection.
+3. **Visualization**: overlay boxes, per-detection counts, and the value HUD.
+
+## Chip Configuration
+
+| Color | Value |
+|-------|-------|
+| White | $1 |
+| Red | $5 |
+| Blue | $10 |
+| Yellow | $25 |
+
+Adjust values live in the Streamlit sidebar, or edit `CHIP_VALUES` in the source.
+
+## Hardware Requirements
+
+- **Video Source**: Raspberry Pi with camera streaming via TCP (e.g., FFmpeg)
+- **Compute**: Apple Silicon (MPS) recommended on Mac; NVIDIA GPU (CUDA) for best
+  performance; CPU works but is slower.
 
 ## Tuning
 
-Adjust these values in `.env` for your setup:
-
-- `PICHIP_SAM_INTERVAL`: Increase for better FPS, decrease for more responsive detection
-- `PICHIP_MIN_REGION_AREA`: Increase if detecting noise, decrease if missing small stacks
-
-HSV color ranges can be tuned in `overlay_viewer.py` (`CHIP_HSV_RANGES` dict) for different lighting conditions.
+- `PICHIP_DETECT_INTERVAL`: increase for higher FPS, decrease for more responsive updates.
+- `PICHIP_CONFIDENCE`: raise to drop low-confidence detections.
+- Retrain with more data (see TRAINING.md) if detection/counting is weak on real chips.
