@@ -43,8 +43,10 @@ The system spans three places:
    counted with Canny edges + peak detection. By default only chips **inside the placement
    guide** are counted (`PICHIP_COUNT_IN_GUIDE`).
 3. **Output** — a viewfinder overlay: a centered **placement guide** ("place tray(s) here"),
-   color-coded corner markers with per-chip counts, and a translucent HUD panel with per-color
-   counts + total value. Shown in a local window and/or served as an MJPEG HTTP stream.
+   color-coded corner markers with per-chip counts, and a charcoal HUD panel — rendered in a
+   real TTF typeface (Sora + JetBrains Mono via Pillow) with poker-chip swatches, tabular
+   per-color counts, and a gold total. Shown in a local window and/or served as an MJPEG HTTP
+   stream.
 
 Inference runs in a **background thread**, so capture/display/streaming stay at full camera
 frame rate (~15 fps on a Pi 4) while detections refresh asynchronously a couple of times a
@@ -61,6 +63,7 @@ pichip_viewer/
 ├── TRAINING.md         # End-to-end runbook (generate → train → run)
 ├── README.html         # Architecture diagram (open in a browser)
 ├── models/             # Model weights (gitignored)
+├── fonts/              # Bundled HUD typefaces (Sora + JetBrains Mono, OFL)
 ├── web/                # Streamlit debug app (YOLO-World / experimentation)
 ├── .env.example
 └── requirements.txt
@@ -172,6 +175,10 @@ open-vocab YOLO-World mode instead.
 | `PICHIP_GUIDE_DIM` | `0.25` | Dim the area outside the guide (0–1; 0 = off) |
 | `PICHIP_COUNT_IN_GUIDE` | `1` | Only count chips whose center is inside the guide |
 | `PICHIP_STREAM_URL` | `tcp://pichip.local:8888` | Remote TCP source, used only when `PICHIP_SOURCE=stream` |
+| `PICHIP_HUD_THEME` | `league` | HUD palette: `league` (gold-on-charcoal) or `classic` (original colors) |
+| `PICHIP_TEXT_BACKEND` | `auto` | HUD text: `auto` (real TTF via Pillow, else Hershey), `pil`, or `cv2` (legacy font) |
+| `PICHIP_FONT_DISPLAY` | bundled `Sora` | Override path to the display/label typeface (TTF/OTF) |
+| `PICHIP_FONT_MONO` | bundled `JetBrainsMono` | Override path to the tabular numeric typeface (TTF/OTF) |
 
 ## Performance (Raspberry Pi 4, CPU)
 

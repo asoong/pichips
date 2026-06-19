@@ -1,4 +1,5 @@
 import os
+import math
 import time
 import cv2
 import numpy as np
@@ -10,6 +11,16 @@ from queue import Queue
 from dotenv import load_dotenv
 from ultralytics import YOLO
 
+# Pillow renders the HUD text in a real TTF typeface (OpenCV can only draw its blocky
+# Hershey vector fonts). It's always present on the Pi (a transitive dep of ultralytics);
+# if it's somehow missing the overlay falls back to the legacy Hershey renderer.
+try:
+    from PIL import Image, ImageDraw, ImageFont
+
+    PIL_OK = True
+except Exception:  # pragma: no cover
+    PIL_OK = False
+
 load_dotenv()
 
 # Configuration from environment variables
@@ -18,7 +29,9 @@ STREAM_URL = os.getenv("PICHIP_STREAM_URL", "tcp://pichip.local:8888")
 # class names (white_face, red_edge, ...) are embedded in the weights and read back via
 # model.names, so this file never hardcodes the class list.
 DETECTOR_PATH = Path(os.getenv("PICHIP_DETECTOR_PATH", "models/pichip_detector.pt"))
-DETECT_INTERVAL = int(os.getenv("PICHIP_DETECT_INTERVAL", "5"))  # legacy; unused (async now)
+DETECT_INTERVAL = int(
+    os.getenv("PICHIP_DETECT_INTERVAL", "5")
+)  # legacy; unused (async now)
 CONFIDENCE = float(os.getenv("PICHIP_CONFIDENCE", "0.3"))
 DEVICE_PREF = os.getenv("PICHIP_DEVICE", "auto")
 # Inference resolution. 0 = the model's native size. Lower (e.g. 416/320) is much faster
@@ -109,7 +122,9 @@ def start_mjpeg_server(port):
                         continue
                     self.wfile.write(b"--frame\r\n")
                     self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                    self.wfile.write(("Content-Length: %d\r\n\r\n" % len(jpeg)).encode())
+                    self.wfile.write(
+                        ("Content-Length: %d\r\n\r\n" % len(jpeg)).encode()
+                    )
                     self.wfile.write(jpeg)
                     self.wfile.write(b"\r\n")
             except (BrokenPipeError, ConnectionResetError):
@@ -121,6 +136,7 @@ def start_mjpeg_server(port):
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     Thread(target=server.serve_forever, daemon=True).start()
     return server
+
 
 # Chip configuration - 4 types: white, red, blue, yellow
 CHIP_VALUES = {
@@ -138,20 +154,55 @@ CHIP_COLORS_BGR = {
     "yellow": (0, 255, 255),
 }
 
+# ---- Overlay typography ----
+# Bundled variable TTFs (offline-safe on the Pi); the per-role weight is set via the
+# font's `wght` axis. Override either path with an absolute path to swap typefaces.
+FONT_DIR = Path(__file__).resolve().parent / "fonts"
+FONT_DISPLAY = os.getenv("PICHIP_FONT_DISPLAY", "") or str(FONT_DIR / "Sora.ttf")
+FONT_MONO = os.getenv("PICHIP_FONT_MONO", "") or str(FONT_DIR / "JetBrainsMono.ttf")
+# Text backend: auto = PIL/TTF when available, else cv2 Hershey; cv2 forces the legacy
+# look; pil forces PIL (degrades to PIL's default font if the TTF can't load).
+TEXT_BACKEND = os.getenv("PICHIP_TEXT_BACKEND", "auto").lower()
+# HUD palette: league = gold-on-charcoal redesign; classic = the original colors.
+HUD_THEME = os.getenv("PICHIP_HUD_THEME", "league").lower()
+
+# role -> (font path, pixel size, weight-axis value)
+_FONT_SPECS = {
+    "title": (FONT_DISPLAY, 22, 600),
+    "label": (FONT_DISPLAY, 16, 500),
+    "caption": (FONT_DISPLAY, 21, 600),
+    "num": (FONT_MONO, 16, 500),
+    "total": (FONT_MONO, 27, 600),
+    "tag": (FONT_MONO, 15, 600),
+}
+
 # ---- Overlay theme (BGR) ----
-PANEL_BG = (28, 28, 30)  # dark translucent HUD panel
-PANEL_ALPHA = 0.55
-PANEL_BORDER = (90, 90, 95)
-ACCENT = (90, 200, 255)  # warm amber — title + total
-TEXT_PRIMARY = (240, 240, 240)
-TEXT_MUTED = (165, 165, 170)
-GUIDE_COLOR = (150, 230, 120)  # soft green viewfinder
+if HUD_THEME == "classic":
+    PANEL_BG = (28, 28, 30)
+    PANEL_ALPHA = 0.55
+    PANEL_BORDER = (90, 90, 95)
+    ACCENT = (90, 200, 255)  # warm amber — title
+    ACCENT_TOTAL = (90, 200, 255)  # total value
+    TEXT_PRIMARY = (240, 240, 240)
+    TEXT_MUTED = (165, 165, 170)
+    GUIDE_COLOR = (150, 230, 120)  # soft green viewfinder
+else:  # "league" — gold on charcoal
+    PANEL_BG = (23, 21, 20)  # deep charcoal
+    PANEL_ALPHA = 0.62
+    PANEL_BORDER = (40, 78, 90)  # faint gold hairline
+    ACCENT = (60, 200, 235)  # brand gold (#EBC83C)
+    ACCENT_TOTAL = (78, 210, 244)  # brighter gold (#F4D24E)
+    TEXT_PRIMARY = (240, 238, 236)
+    TEXT_MUTED = (126, 120, 120)
+    GUIDE_COLOR = (74, 184, 216)  # soft gold viewfinder (#D8B84A)
 
 # ---- Placement guide config ----
 GUIDE_ON = os.getenv("PICHIP_GUIDE", "1").lower() not in ("0", "false", "no", "off")
 GUIDE_SHAPE = os.getenv("PICHIP_GUIDE_SHAPE", "wide").lower()  # wide | square
 GUIDE_SCALE = float(os.getenv("PICHIP_GUIDE_SCALE", "0.7"))  # fraction of frame width
-GUIDE_DIM = float(os.getenv("PICHIP_GUIDE_DIM", "0.25"))  # 0..1 dim outside guide (0 = off)
+GUIDE_DIM = float(
+    os.getenv("PICHIP_GUIDE_DIM", "0.25")
+)  # 0..1 dim outside guide (0 = off)
 COUNT_IN_GUIDE = os.getenv("PICHIP_COUNT_IN_GUIDE", "1").lower() not in (
     "0",
     "false",
@@ -298,7 +349,7 @@ def guide_rect(shape):
     cx, cy = w // 2, h // 2
     gw = int(max(40, min(w * GUIDE_SCALE, w - 20)))
     # Keep the guide clear of the top-left HUD panel so its corner isn't occluded.
-    gw = min(gw, 2 * max(60, cx - 220))
+    gw = min(gw, 2 * max(60, cx - 240))
     ratio = 1.0 if GUIDE_SHAPE == "square" else 0.45
     gh = int(gw * ratio)
     if gh > h - 20:
@@ -334,14 +385,20 @@ def detect(model, frame_gray, results, guide=None):
         classes = r.boxes.cls.cpu().numpy().astype(int)
 
         for box, conf, cls in zip(boxes, confs, classes):
-            label = names.get(int(cls), str(cls)) if isinstance(names, dict) else names[int(cls)]
+            label = (
+                names.get(int(cls), str(cls))
+                if isinstance(names, dict)
+                else names[int(cls)]
+            )
             color, orientation = parse_label(label)
             if color is None:
                 continue
             if guide is not None and COUNT_IN_GUIDE and not _center_in_rect(box, guide):
                 continue
 
-            count = count_chips_in_stack(frame_gray, box) if orientation == "edge" else 1
+            count = (
+                count_chips_in_stack(frame_gray, box) if orientation == "edge" else 1
+            )
 
             detections.append(
                 {
@@ -357,8 +414,8 @@ def detect(model, frame_gray, results, guide=None):
     return detections, counts
 
 
-def _text(img, text, org, scale, color, thickness=1, shadow=True):
-    """Anti-aliased text with a subtle dark shadow for legibility over the camera image."""
+def _text_cv2(img, text, org, scale, color, thickness=1, shadow=True):
+    """Legacy Hershey text with a dark shadow — the fallback when PIL is unavailable."""
     if shadow:
         cv2.putText(
             img,
@@ -373,6 +430,136 @@ def _text(img, text, org, scale, color, thickness=1, shadow=True):
     cv2.putText(
         img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA
     )
+
+
+_font_cache = {}
+
+
+def _font(role):
+    """Cached PIL ImageFont for a role; weight set via the variable-font `wght` axis.
+
+    Degrades to PIL's built-in font if the TTF can't be opened, so a misdeploy renders in
+    a plain face instead of crashing.
+    """
+    if role in _font_cache:
+        return _font_cache[role]
+    path, size, weight = _FONT_SPECS[role]
+    try:
+        f = ImageFont.truetype(path, size)
+        try:
+            f.set_variation_by_axes([weight])
+        except Exception:
+            pass  # static (non-variable) font — use its default instance
+    except Exception:
+        try:
+            f = ImageFont.load_default(size)
+        except TypeError:
+            f = ImageFont.load_default()
+    _font_cache[role] = f
+    return f
+
+
+def _bgr2rgb(color):
+    """OpenCV palette colors are BGR; PIL wants RGB."""
+    return (int(color[2]), int(color[1]), int(color[0]))
+
+
+class _TextLayer:
+    """Collects overlay text during compose and rasterizes it in one PIL pass per frame.
+
+    Shapes are drawn with cv2 first; each text string is queued via add() and painted by
+    flush() after a single BGR<->RGB conversion of the frame. When PIL is unavailable (or
+    PICHIP_TEXT_BACKEND=cv2), add() renders immediately with the legacy Hershey font and
+    flush() is a no-op — the overlay always draws, worst case in the old font.
+    """
+
+    _use_pil = PIL_OK and TEXT_BACKEND != "cv2"
+
+    # Legacy cv2 (scale, thickness) per role, for the fallback path.
+    _CV2 = {
+        "title": (0.6, 1),
+        "label": (0.5, 1),
+        "caption": (0.7, 2),
+        "num": (0.5, 1),
+        "total": (0.8, 2),
+        "tag": (0.5, 1),
+    }
+    # OpenCV's Hershey font is ASCII-only; map the few non-ASCII glyphs we use so the
+    # fallback doesn't render them as "??". (The PIL path renders them natively.)
+    _ASCII = str.maketrans({"×": "x"})
+
+    def __init__(self):
+        self._items = []
+
+    def add(self, img, xy, text, role, color, anchor="lm", stroke=1):
+        """Queue (PIL) or immediately draw (cv2) `text`. anchor is a PIL anchor string
+        (horizontal l/m/r + vertical m=middle); we only use vertically-centered text."""
+        if self._use_pil:
+            self._items.append((xy, str(text), role, _bgr2rgb(color), anchor, stroke))
+        else:
+            self._add_cv2(img, xy, str(text), role, color, anchor)
+
+    def measure(self, text, role):
+        """Advance width of `text` in px — replaces cv2.getTextSize for right-alignment."""
+        if self._use_pil:
+            return _font(role).getlength(str(text))
+        scale, thick = self._CV2[role]
+        safe = str(text).translate(self._ASCII)
+        (tw, _), _ = cv2.getTextSize(safe, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+        return tw
+
+    def flush(self, img):
+        if not self._use_pil or not self._items:
+            return img
+        pil = Image.fromarray(np.ascontiguousarray(img[:, :, ::-1]))  # BGR->RGB
+        draw = ImageDraw.Draw(pil)
+        for xy, text, role, rgb, anchor, stroke in self._items:
+            draw.text(
+                (int(xy[0]), int(xy[1])),
+                text,
+                font=_font(role),
+                fill=rgb,
+                anchor=anchor,
+                stroke_width=stroke,
+                stroke_fill=(0, 0, 0),
+            )
+        img[:, :, :] = np.asarray(pil)[:, :, ::-1]  # RGB->BGR, in place
+        return img
+
+    def _add_cv2(self, img, xy, text, role, color, anchor):
+        scale, thick = self._CV2[role]
+        text = text.translate(self._ASCII)
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+        x, y = xy
+        h = anchor[0] if anchor else "l"
+        v = anchor[1] if len(anchor) > 1 else "m"
+        if h == "m":
+            x -= tw / 2
+        elif h == "r":
+            x -= tw
+        if v == "m":
+            y += th / 2  # cv2 origin is the baseline; center the cap height on y
+        elif v in ("a", "t"):
+            y += th
+        _text_cv2(img, text, (int(x), int(y)), scale, color, thick)
+
+
+def _draw_chip_swatch(vis, center, r, color, active):
+    """A small poker-chip glyph: filled disc + rim + edge spots; ring-only when inactive."""
+    cx, cy = int(center[0]), int(center[1])
+    if not active:
+        dim = tuple(int(c * 0.40 + 18) for c in color)
+        cv2.circle(vis, (cx, cy), r, dim, 1, cv2.LINE_AA)
+        return
+    cv2.circle(vis, (cx, cy), r, color, -1, cv2.LINE_AA)
+    cv2.circle(vis, (cx, cy), r, (35, 35, 40), 1, cv2.LINE_AA)
+    for ang in range(0, 360, 45):
+        a = math.radians(ang)
+        x1 = int(cx + (r - 2) * math.cos(a))
+        y1 = int(cy + (r - 2) * math.sin(a))
+        x2 = int(cx + (r + 1) * math.cos(a))
+        y2 = int(cy + (r + 1) * math.sin(a))
+        cv2.line(vis, (x1, y1), (x2, y2), (245, 245, 245), 1, cv2.LINE_AA)
 
 
 def _rounded_rect(img, p1, p2, color, radius, thickness=-1):
@@ -401,7 +588,9 @@ def _rounded_rect(img, p1, p2, color, radius, thickness=-1):
             (x1 + r, y2 - r, 90),
             (x2 - r, y2 - r, 0),
         ):
-            cv2.ellipse(img, (cx, cy), (r, r), ang, 0, 90, color, thickness, cv2.LINE_AA)
+            cv2.ellipse(
+                img, (cx, cy), (r, r), ang, 0, 90, color, thickness, cv2.LINE_AA
+            )
 
 
 def _alpha_panel(vis, p1, p2, color, alpha, radius):
@@ -416,7 +605,7 @@ def _alpha_panel(vis, p1, p2, color, alpha, radius):
     cv2.addWeighted(panel, alpha, roi, 1 - alpha, 0, roi)
 
 
-def draw_placement_guide(vis, show_caption=False):
+def draw_placement_guide(vis, layer, show_caption=False):
     """Dim the area outside the guide and draw a viewfinder reticle (+ optional caption)."""
     if not GUIDE_ON:
         return
@@ -439,13 +628,12 @@ def draw_placement_guide(vis, show_caption=False):
 
     if show_caption:
         cap = "Place tray(s) here"
-        (tw, th), _ = cv2.getTextSize(cap, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-        tx = (x1 + x2) // 2 - tw // 2
-        ty = y1 - 14 if y1 - 14 > th else y2 + th + 14
-        _text(vis, cap, (tx, ty), 0.7, GUIDE_COLOR, 2)
+        tx = (x1 + x2) // 2
+        ty = y1 - 18 if y1 - 18 > 18 else y2 + 18
+        layer.add(vis, (tx, ty), cap, "caption", GUIDE_COLOR, anchor="mm", stroke=2)
 
 
-def _draw_detection(vis, det):
+def _draw_detection(vis, det, layer):
     """Corner-bracket marker in the chip color + a compact rounded count tag."""
     x1, y1, x2, y2 = (int(v) for v in det["box"])
     bgr = CHIP_COLORS_BGR.get(det["color"], (0, 255, 0))
@@ -457,70 +645,82 @@ def _draw_detection(vis, det):
             cv2.line(vis, (cx, cy), (cx, cy + sy * arm), bgr, 2, cv2.LINE_AA)
 
     tag = str(det["count"])
-    (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_DUPLEX, 0.5, 1)
-    pad = 4
-    ty1 = max(0, y1 - th - 2 * pad)
-    _rounded_rect(vis, (x1, ty1), (x1 + tw + 2 * pad, ty1 + th + 2 * pad), bgr, 5, -1)
+    pad = 5
+    bw = int(layer.measure(tag, "tag")) + 2 * pad
+    bh = 16 + 2 * pad
+    ty1 = max(0, y1 - bh)
+    _rounded_rect(vis, (x1, ty1), (x1 + bw, ty1 + bh), bgr, 5, -1)
     # Dark text on light swatches (white/yellow), white otherwise, for contrast.
     txt = (20, 20, 20) if det["color"] in ("white", "yellow") else (255, 255, 255)
-    cv2.putText(
-        vis,
-        tag,
-        (x1 + pad, ty1 + th + pad),
-        cv2.FONT_HERSHEY_DUPLEX,
-        0.5,
-        txt,
-        1,
-        cv2.LINE_AA,
-    )
+    layer.add(vis, (x1 + bw / 2, ty1 + bh / 2), tag, "tag", txt, anchor="mm", stroke=0)
 
 
-def _draw_hud(vis, chip_counts):
-    """Translucent rounded panel: title, per-color rows (swatch + count + value), total."""
+def _draw_hud(vis, chip_counts, layer):
+    """Charcoal panel: gold title, per-color tabular rows (chip + ×count + $value), total."""
     colors = ["white", "red", "blue", "yellow"]
     total_value = sum(c * CHIP_VALUES.get(col, 0) for col, c in chip_counts.items())
 
-    pad, row_h = 12, 26
-    x0, y0, panel_w = 12, 12, 196
-    panel_h = 26 + len(colors) * row_h + 14 + 30 + pad
+    x0, y0, pad, panel_w = 12, 12, 14, 206
+    row_h = 28
 
-    _alpha_panel(vis, (x0, y0), (x0 + panel_w, y0 + panel_h), PANEL_BG, PANEL_ALPHA, 12)
-    _rounded_rect(vis, (x0, y0), (x0 + panel_w, y0 + panel_h), PANEL_BORDER, 12, 1)
+    # Precompute vertical anchors (text is vertically centered on each *_cy).
+    title_cy = y0 + pad + 15
+    rule1_y = y0 + pad + 30 + 6
+    rows_top = rule1_y + 10
+    rule2_y = rows_top + len(colors) * row_h + 6
+    total_cy = rule2_y + 10 + 19
+    panel_h = (total_cy + 19 + pad) - y0
 
-    cx = x0 + pad
+    _alpha_panel(vis, (x0, y0), (x0 + panel_w, y0 + panel_h), PANEL_BG, PANEL_ALPHA, 14)
+    _rounded_rect(vis, (x0, y0), (x0 + panel_w, y0 + panel_h), PANEL_BORDER, 14, 1)
+
+    left = x0 + pad
     right = x0 + panel_w - pad
-    y = y0 + pad + 14
-    _text(vis, "PICHIP", (cx, y), 0.6, ACCENT, 1)
-    y += 24
+    x_value = right  # right edge of the $value column
+    x_count = right - 66  # right edge of the ×count column
 
-    for col in colors:
+    layer.add(vis, (left, title_cy), "PICHIP", "title", ACCENT, anchor="lm")
+    cv2.line(vis, (left, rule1_y), (right, rule1_y), PANEL_BORDER, 1, cv2.LINE_AA)
+
+    for i, col in enumerate(colors):
         cnt = chip_counts.get(col, 0)
         val = cnt * CHIP_VALUES.get(col, 0)
-        _rounded_rect(vis, (cx, y - 11), (cx + 14, y + 3), CHIP_COLORS_BGR[col], 4, -1)
-        _text(vis, col, (cx + 22, y), 0.5, TEXT_PRIMARY if cnt else TEXT_MUTED, 1)
-        amount = f"x{cnt}   ${val}"
-        (tw, _), _ = cv2.getTextSize(amount, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        _text(vis, amount, (right - tw, y), 0.5, TEXT_PRIMARY if cnt else TEXT_MUTED, 1)
-        y += row_h
+        active = cnt > 0
+        cy = rows_top + row_h // 2 + i * row_h
+        _draw_chip_swatch(vis, (left + 8, cy), 8, CHIP_COLORS_BGR[col], active)
+        tcol = TEXT_PRIMARY if active else TEXT_MUTED
+        layer.add(vis, (left + 26, cy), col, "label", tcol, anchor="lm")
+        layer.add(vis, (x_count, cy), f"×{cnt}", "num", tcol, anchor="rm")
+        layer.add(vis, (x_value, cy), f"${val}", "num", tcol, anchor="rm")
 
-    y += 4
-    cv2.line(vis, (cx, y), (right, y), PANEL_BORDER, 1, cv2.LINE_AA)
-    y += 24
-    _text(vis, "TOTAL", (cx, y), 0.6, TEXT_MUTED, 1)
-    tv = f"${total_value}"
-    (tw, _), _ = cv2.getTextSize(tv, cv2.FONT_HERSHEY_DUPLEX, 0.8, 2)
-    _text(vis, tv, (right - tw, y + 2), 0.8, ACCENT, 2)
+    cv2.line(vis, (left, rule2_y), (right, rule2_y), PANEL_BORDER, 1, cv2.LINE_AA)
+    layer.add(vis, (left, total_cy), "TOTAL", "label", TEXT_MUTED, anchor="lm")
+    layer.add(
+        vis,
+        (x_value, total_cy),
+        f"${total_value}",
+        "total",
+        ACCENT_TOTAL,
+        anchor="rm",
+        stroke=2,
+    )
 
 
 def draw_visualization(frame, detections, chip_counts):
-    """Compose the overlay: placement guide, per-chip markers, and the value HUD."""
+    """Compose the overlay: placement guide, per-chip markers, and the value HUD.
+
+    cv2 shapes are drawn first; all text is collected in `layer` and rasterized in a
+    single PIL pass by layer.flush() so the frame is converted BGR<->RGB only once.
+    """
     vis = frame.copy()
     total_chips = sum(chip_counts.values())
+    layer = _TextLayer()
 
-    draw_placement_guide(vis, show_caption=(total_chips == 0))
+    draw_placement_guide(vis, layer, show_caption=(total_chips == 0))
     for det in detections:
-        _draw_detection(vis, det)
-    _draw_hud(vis, chip_counts)
+        _draw_detection(vis, det, layer)
+    _draw_hud(vis, chip_counts, layer)
+    layer.flush(vis)
     return vis
 
 
