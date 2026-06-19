@@ -138,6 +138,27 @@ CHIP_COLORS_BGR = {
     "yellow": (0, 255, 255),
 }
 
+# ---- Overlay theme (BGR) ----
+PANEL_BG = (28, 28, 30)  # dark translucent HUD panel
+PANEL_ALPHA = 0.55
+PANEL_BORDER = (90, 90, 95)
+ACCENT = (90, 200, 255)  # warm amber — title + total
+TEXT_PRIMARY = (240, 240, 240)
+TEXT_MUTED = (165, 165, 170)
+GUIDE_COLOR = (150, 230, 120)  # soft green viewfinder
+
+# ---- Placement guide config ----
+GUIDE_ON = os.getenv("PICHIP_GUIDE", "1").lower() not in ("0", "false", "no", "off")
+GUIDE_SHAPE = os.getenv("PICHIP_GUIDE_SHAPE", "wide").lower()  # wide | square
+GUIDE_SCALE = float(os.getenv("PICHIP_GUIDE_SCALE", "0.7"))  # fraction of frame width
+GUIDE_DIM = float(os.getenv("PICHIP_GUIDE_DIM", "0.25"))  # 0..1 dim outside guide (0 = off)
+COUNT_IN_GUIDE = os.getenv("PICHIP_COUNT_IN_GUIDE", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
 
 class VideoCapture:
     """Threaded video capture to avoid blocking."""
@@ -266,8 +287,41 @@ def count_chips_in_stack(frame_gray, box):
     return min(count, max(1, max_possible))
 
 
-def detect(model, frame_gray, results):
-    """Turn raw YOLO results into chip detections with per-stack counts."""
+def guide_rect(shape):
+    """Centered placement-guide rectangle (x1, y1, x2, y2) for a frame of this shape.
+
+    Wide (tray-shaped) by default; square when PICHIP_GUIDE_SHAPE=square. Width is
+    GUIDE_SCALE of the frame width; height follows the shape, both clamped to the frame.
+    This is the single source of truth used by both counting and drawing.
+    """
+    h, w = shape[:2]
+    cx, cy = w // 2, h // 2
+    gw = int(max(40, min(w * GUIDE_SCALE, w - 20)))
+    # Keep the guide clear of the top-left HUD panel so its corner isn't occluded.
+    gw = min(gw, 2 * max(60, cx - 220))
+    ratio = 1.0 if GUIDE_SHAPE == "square" else 0.45
+    gh = int(gw * ratio)
+    if gh > h - 20:
+        gh = h - 20
+        if GUIDE_SHAPE == "square":
+            gw = gh
+    x1, y1 = cx - gw // 2, cy - gh // 2
+    return (x1, y1, x1 + gw, y1 + gh)
+
+
+def _center_in_rect(box, rect):
+    cx = (box[0] + box[2]) / 2
+    cy = (box[1] + box[3]) / 2
+    return rect[0] <= cx <= rect[2] and rect[1] <= cy <= rect[3]
+
+
+def detect(model, frame_gray, results, guide=None):
+    """Turn raw YOLO results into chip detections with per-stack counts.
+
+    When a guide rect is given and PICHIP_COUNT_IN_GUIDE is on, detections whose center
+    falls outside the guide are dropped (so both counts and drawn markers stay scoped to
+    the placement box).
+    """
     names = model.names
     detections = []
     counts = defaultdict(int)
@@ -283,6 +337,8 @@ def detect(model, frame_gray, results):
             label = names.get(int(cls), str(cls)) if isinstance(names, dict) else names[int(cls)]
             color, orientation = parse_label(label)
             if color is None:
+                continue
+            if guide is not None and COUNT_IN_GUIDE and not _center_in_rect(box, guide):
                 continue
 
             count = count_chips_in_stack(frame_gray, box) if orientation == "edge" else 1
@@ -301,67 +357,170 @@ def detect(model, frame_gray, results):
     return detections, counts
 
 
-def draw_visualization(frame, detections, chip_counts):
-    """Draw detection boxes, per-chip labels, and the value HUD."""
-    vis = frame.copy()
-
-    for det in detections:
-        x1, y1, x2, y2 = (int(v) for v in det["box"])
-        color = det["color"]
-        bgr = CHIP_COLORS_BGR.get(color, (0, 255, 0))
-
-        cv2.rectangle(vis, (x1, y1), (x2, y2), bgr, 2)
-
-        label = f"{color} {det['orientation']}: {det['count']} ({det['score']:.0%})"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        label_y = max(y1 - 5, th + 5)
-        cv2.rectangle(
-            vis, (x1, label_y - th - 4), (x1 + tw + 4, label_y + 2), (0, 0, 0), -1
-        )
+def _text(img, text, org, scale, color, thickness=1, shadow=True):
+    """Anti-aliased text with a subtle dark shadow for legibility over the camera image."""
+    if shadow:
         cv2.putText(
-            vis,
-            label,
-            (x1 + 2, label_y),
+            img,
+            text,
+            (org[0] + 1, org[1] + 1),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
+            scale,
+            (0, 0, 0),
+            thickness + 1,
+            cv2.LINE_AA,
         )
-
-    # Draw HUD
-    total_value = sum(
-        count * CHIP_VALUES.get(color, 0) for color, count in chip_counts.items()
-    )
-
-    overlay = vis.copy()
-    cv2.rectangle(overlay, (5, 5), (170, 145), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.7, vis, 0.3, 0, vis)
-
-    y_pos = 25
     cv2.putText(
-        vis, "Chip Counts:", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
+        img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA
     )
-    y_pos += 24
 
-    for color in ["white", "red", "blue", "yellow"]:
-        count = chip_counts.get(color, 0)
-        value = count * CHIP_VALUES.get(color, 0)
-        text = f"{color}: {count} (${value})"
-        bgr = CHIP_COLORS_BGR.get(color, (255, 255, 255))
-        cv2.putText(vis, text, (15, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, bgr, 1)
-        y_pos += 22
 
-    y_pos += 5
+def _rounded_rect(img, p1, p2, color, radius, thickness=-1):
+    """Filled (thickness=-1) or outlined rounded rectangle."""
+    x1, y1 = p1
+    x2, y2 = p2
+    r = max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+    if thickness < 0:
+        cv2.rectangle(img, (x1 + r, y1), (x2 - r, y2), color, -1)
+        cv2.rectangle(img, (x1, y1 + r), (x2, y2 - r), color, -1)
+        for cx, cy in (
+            (x1 + r, y1 + r),
+            (x2 - r, y1 + r),
+            (x1 + r, y2 - r),
+            (x2 - r, y2 - r),
+        ):
+            cv2.circle(img, (cx, cy), r, color, -1, cv2.LINE_AA)
+    else:
+        cv2.line(img, (x1 + r, y1), (x2 - r, y1), color, thickness, cv2.LINE_AA)
+        cv2.line(img, (x1 + r, y2), (x2 - r, y2), color, thickness, cv2.LINE_AA)
+        cv2.line(img, (x1, y1 + r), (x1, y2 - r), color, thickness, cv2.LINE_AA)
+        cv2.line(img, (x2, y1 + r), (x2, y2 - r), color, thickness, cv2.LINE_AA)
+        for cx, cy, ang in (
+            (x1 + r, y1 + r, 180),
+            (x2 - r, y1 + r, 270),
+            (x1 + r, y2 - r, 90),
+            (x2 - r, y2 - r, 0),
+        ):
+            cv2.ellipse(img, (cx, cy), (r, r), ang, 0, 90, color, thickness, cv2.LINE_AA)
+
+
+def _alpha_panel(vis, p1, p2, color, alpha, radius):
+    """Blend a translucent rounded panel onto vis over the given ROI (corners untouched)."""
+    x1, y1 = max(0, p1[0]), max(0, p1[1])
+    x2, y2 = min(vis.shape[1], p2[0]), min(vis.shape[0], p2[1])
+    if x2 <= x1 or y2 <= y1:
+        return
+    roi = vis[y1:y2, x1:x2]
+    panel = roi.copy()
+    _rounded_rect(panel, (0, 0), (x2 - x1 - 1, y2 - y1 - 1), color, radius, -1)
+    cv2.addWeighted(panel, alpha, roi, 1 - alpha, 0, roi)
+
+
+def draw_placement_guide(vis, show_caption=False):
+    """Dim the area outside the guide and draw a viewfinder reticle (+ optional caption)."""
+    if not GUIDE_ON:
+        return
+    h, w = vis.shape[:2]
+    x1, y1, x2, y2 = guide_rect(vis.shape)
+
+    # Dim everything outside the guide to focus attention on the tray area.
+    if GUIDE_DIM > 0:
+        dark = (vis * (1.0 - GUIDE_DIM)).astype(np.uint8)
+        dark[y1:y2, x1:x2] = vis[y1:y2, x1:x2]
+        vis[:] = dark
+
+    # Faint full outline + bright L-shaped corner brackets.
+    cv2.rectangle(vis, (x1, y1), (x2, y2), GUIDE_COLOR, 1, cv2.LINE_AA)
+    arm = max(18, int(min(x2 - x1, y2 - y1) * 0.08))
+    for cx, sx in ((x1, 1), (x2, -1)):
+        for cy, sy in ((y1, 1), (y2, -1)):
+            cv2.line(vis, (cx, cy), (cx + sx * arm, cy), GUIDE_COLOR, 3, cv2.LINE_AA)
+            cv2.line(vis, (cx, cy), (cx, cy + sy * arm), GUIDE_COLOR, 3, cv2.LINE_AA)
+
+    if show_caption:
+        cap = "Place tray(s) here"
+        (tw, th), _ = cv2.getTextSize(cap, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        tx = (x1 + x2) // 2 - tw // 2
+        ty = y1 - 14 if y1 - 14 > th else y2 + th + 14
+        _text(vis, cap, (tx, ty), 0.7, GUIDE_COLOR, 2)
+
+
+def _draw_detection(vis, det):
+    """Corner-bracket marker in the chip color + a compact rounded count tag."""
+    x1, y1, x2, y2 = (int(v) for v in det["box"])
+    bgr = CHIP_COLORS_BGR.get(det["color"], (0, 255, 0))
+
+    arm = max(8, int(min(x2 - x1, y2 - y1) * 0.28))
+    for cx, sx in ((x1, 1), (x2, -1)):
+        for cy, sy in ((y1, 1), (y2, -1)):
+            cv2.line(vis, (cx, cy), (cx + sx * arm, cy), bgr, 2, cv2.LINE_AA)
+            cv2.line(vis, (cx, cy), (cx, cy + sy * arm), bgr, 2, cv2.LINE_AA)
+
+    tag = str(det["count"])
+    (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_DUPLEX, 0.5, 1)
+    pad = 4
+    ty1 = max(0, y1 - th - 2 * pad)
+    _rounded_rect(vis, (x1, ty1), (x1 + tw + 2 * pad, ty1 + th + 2 * pad), bgr, 5, -1)
+    # Dark text on light swatches (white/yellow), white otherwise, for contrast.
+    txt = (20, 20, 20) if det["color"] in ("white", "yellow") else (255, 255, 255)
     cv2.putText(
         vis,
-        f"Total: ${total_value}",
-        (10, y_pos),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (0, 255, 255),
-        2,
+        tag,
+        (x1 + pad, ty1 + th + pad),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.5,
+        txt,
+        1,
+        cv2.LINE_AA,
     )
 
+
+def _draw_hud(vis, chip_counts):
+    """Translucent rounded panel: title, per-color rows (swatch + count + value), total."""
+    colors = ["white", "red", "blue", "yellow"]
+    total_value = sum(c * CHIP_VALUES.get(col, 0) for col, c in chip_counts.items())
+
+    pad, row_h = 12, 26
+    x0, y0, panel_w = 12, 12, 196
+    panel_h = 26 + len(colors) * row_h + 14 + 30 + pad
+
+    _alpha_panel(vis, (x0, y0), (x0 + panel_w, y0 + panel_h), PANEL_BG, PANEL_ALPHA, 12)
+    _rounded_rect(vis, (x0, y0), (x0 + panel_w, y0 + panel_h), PANEL_BORDER, 12, 1)
+
+    cx = x0 + pad
+    right = x0 + panel_w - pad
+    y = y0 + pad + 14
+    _text(vis, "PICHIP", (cx, y), 0.6, ACCENT, 1)
+    y += 24
+
+    for col in colors:
+        cnt = chip_counts.get(col, 0)
+        val = cnt * CHIP_VALUES.get(col, 0)
+        _rounded_rect(vis, (cx, y - 11), (cx + 14, y + 3), CHIP_COLORS_BGR[col], 4, -1)
+        _text(vis, col, (cx + 22, y), 0.5, TEXT_PRIMARY if cnt else TEXT_MUTED, 1)
+        amount = f"x{cnt}   ${val}"
+        (tw, _), _ = cv2.getTextSize(amount, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        _text(vis, amount, (right - tw, y), 0.5, TEXT_PRIMARY if cnt else TEXT_MUTED, 1)
+        y += row_h
+
+    y += 4
+    cv2.line(vis, (cx, y), (right, y), PANEL_BORDER, 1, cv2.LINE_AA)
+    y += 24
+    _text(vis, "TOTAL", (cx, y), 0.6, TEXT_MUTED, 1)
+    tv = f"${total_value}"
+    (tw, _), _ = cv2.getTextSize(tv, cv2.FONT_HERSHEY_DUPLEX, 0.8, 2)
+    _text(vis, tv, (right - tw, y + 2), 0.8, ACCENT, 2)
+
+
+def draw_visualization(frame, detections, chip_counts):
+    """Compose the overlay: placement guide, per-chip markers, and the value HUD."""
+    vis = frame.copy()
+    total_chips = sum(chip_counts.values())
+
+    draw_placement_guide(vis, show_caption=(total_chips == 0))
+    for det in detections:
+        _draw_detection(vis, det)
+    _draw_hud(vis, chip_counts)
     return vis
 
 
@@ -423,7 +582,7 @@ class InferenceWorker(Thread):
                 continue
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             results = self.model.predict(frame, **predict_kw)
-            dets, counts = detect(self.model, gray, results)
+            dets, counts = detect(self.model, gray, results, guide_rect(frame.shape))
             with self._lock:
                 self._detections, self._counts = dets, counts
 

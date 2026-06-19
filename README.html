@@ -164,7 +164,7 @@
         <li><b class="n">1</b><b>Web client</b> — generate synthetic chip images, segment + label them into 9 classes (<code>&lt;color&gt;_&lt;face|edge&gt;</code>), curate, and export a YOLO-format <code>dataset.zip</code>.</li>
         <li><b class="n">2</b><b>Mac</b> — <code>train.py</code> fine-tunes a YOLO model on that dataset (Apple-Silicon MPS) and writes <code>models/pichip_detector.pt</code>. The class names are baked into the weights.</li>
         <li><b class="n">3</b><b>Pi</b> — <code>deploy_model.sh</code> exports the model to ONNX (~1.7× faster on the Pi CPU). <code>overlay_viewer.py</code> grabs camera frames via <strong>picamera2</strong>, runs detection <em>in a background thread</em> (so the feed stays ~15 fps while detections refresh asynchronously), derives color + orientation from the class names, edge-counts side-lying stacks, and draws the value HUD.</li>
-        <li><b class="n">4</b><b>Watch it</b> — the annotated frames are served as an <strong>MJPEG HTTP stream</strong> on port 8090 (open in a browser on your Mac) and/or shown in a window on a monitor plugged into the Pi.</li>
+        <li><b class="n">4</b><b>Watch it</b> — a viewfinder overlay shows a centered <strong>placement guide</strong> ("place tray(s) here"; only chips inside it are counted), color-coded corner markers, and a translucent HUD with per-color counts + total. The annotated frames are served as an <strong>MJPEG HTTP stream</strong> on port 8090 (open in a browser on your Mac) and/or shown in a window on a monitor plugged into the Pi.</li>
       </ol>
 
       <h2>Commands</h2>

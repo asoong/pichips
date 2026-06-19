@@ -40,9 +40,11 @@ The system spans three places:
    `<color>_<face|edge>` (color ∈ white/red/blue/yellow). Class names are embedded in the
    weights, so the viewer reads them via `model.names` and never hardcodes a list.
 2. **Counting** — a face-on chip counts as 1; a side-lying *stack* (one `edge` detection) is
-   counted with Canny edges + peak detection.
-3. **Output** — boxes + per-chip counts + a running value HUD, shown in a local window and/or
-   served as an MJPEG HTTP stream.
+   counted with Canny edges + peak detection. By default only chips **inside the placement
+   guide** are counted (`PICHIP_COUNT_IN_GUIDE`).
+3. **Output** — a viewfinder overlay: a centered **placement guide** ("place tray(s) here"),
+   color-coded corner markers with per-chip counts, and a translucent HUD panel with per-color
+   counts + total value. Shown in a local window and/or served as an MJPEG HTTP stream.
 
 Inference runs in a **background thread**, so capture/display/streaming stay at full camera
 frame rate (~15 fps on a Pi 4) while detections refresh asynchronously a couple of times a
@@ -164,6 +166,11 @@ open-vocab YOLO-World mode instead.
 | `PICHIP_CAMERA_WIDTH` / `PICHIP_CAMERA_HEIGHT` | `1280` / `720` | picamera2 capture size |
 | `PICHIP_CAMERA_SWAP_RB` | `0` | Set `1` if camera colors look red/blue-swapped |
 | `PICHIP_HEADLESS` | auto | Force no-window mode (auto-on when there's no display) |
+| `PICHIP_GUIDE` | `1` | Show the centered placement guide (0 = off) |
+| `PICHIP_GUIDE_SHAPE` | `wide` | Guide shape: `wide` (tray) or `square` |
+| `PICHIP_GUIDE_SCALE` | `0.7` | Guide width as a fraction of the frame |
+| `PICHIP_GUIDE_DIM` | `0.25` | Dim the area outside the guide (0–1; 0 = off) |
+| `PICHIP_COUNT_IN_GUIDE` | `1` | Only count chips whose center is inside the guide |
 | `PICHIP_STREAM_URL` | `tcp://pichip.local:8888` | Remote TCP source, used only when `PICHIP_SOURCE=stream` |
 
 ## Performance (Raspberry Pi 4, CPU)
