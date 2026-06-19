@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
-from threading import Thread
+from threading import Thread, Lock, Condition
 from queue import Queue
 
 from dotenv import load_dotenv
@@ -20,6 +20,102 @@ DETECTOR_PATH = Path(os.getenv("PICHIP_DETECTOR_PATH", "models/pichip_detector.p
 DETECT_INTERVAL = int(os.getenv("PICHIP_DETECT_INTERVAL", "5"))
 CONFIDENCE = float(os.getenv("PICHIP_CONFIDENCE", "0.3"))
 DEVICE_PREF = os.getenv("PICHIP_DEVICE", "auto")
+
+# Frame source: "stream" reads PICHIP_STREAM_URL over TCP (viewer runs on a separate
+# machine pulling the Pi's stream); "picamera2" captures the Pi's CSI camera directly
+# (viewer runs ON the Pi). Default to the Pi camera when picamera2 is importable.
+SOURCE = os.getenv("PICHIP_SOURCE", "").lower()
+CAMERA_WIDTH = int(os.getenv("PICHIP_CAMERA_WIDTH", "1280"))
+CAMERA_HEIGHT = int(os.getenv("PICHIP_CAMERA_HEIGHT", "720"))
+# picamera2 "RGB888" is already BGR-ordered for OpenCV; flip this if colors look swapped.
+CAMERA_SWAP_RB = os.getenv("PICHIP_CAMERA_SWAP_RB", "0").lower() in ("1", "true", "yes")
+# Headless = no GUI window. Auto-on when there's no display (e.g. over SSH).
+HEADLESS = os.getenv("PICHIP_HEADLESS", "").lower() in ("1", "true", "yes") or not (
+    os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+)
+# Stop after N processed frames (0 = run forever) — handy for a headless smoke test.
+MAX_FRAMES = int(os.getenv("PICHIP_MAX_FRAMES", "0"))
+# When set, write the latest annotated frame here (headless verification).
+SNAPSHOT_PATH = os.getenv("PICHIP_SNAPSHOT_PATH", "")
+# Stream annotated frames as MJPEG over HTTP on this port (0 = off). View from another
+# machine at http://<pi-host>:<port>/ — ideal when the Pi runs headless over SSH.
+MJPEG_PORT = int(os.getenv("PICHIP_MJPEG_PORT", "0"))
+MJPEG_QUALITY = int(os.getenv("PICHIP_MJPEG_QUALITY", "80"))
+
+
+def _resolve_source():
+    """Pick the frame source: explicit PICHIP_SOURCE wins, else auto-detect the Pi cam."""
+    if SOURCE in ("picamera2", "camera", "csi"):
+        return "picamera2"
+    if SOURCE in ("stream", "tcp"):
+        return "stream"
+    # Auto: use the Pi camera if picamera2 is available, else the TCP stream.
+    try:
+        import picamera2  # noqa: F401
+
+        return "picamera2"
+    except Exception:
+        return "stream"
+
+
+# ---- Optional MJPEG-over-HTTP output (watch the live feed from another machine) ----
+
+
+class _FrameBuffer:
+    """Thread-safe holder for the latest annotated JPEG frame."""
+
+    def __init__(self):
+        self._cond = Condition(Lock())
+        self._jpeg = None
+
+    def update(self, jpeg_bytes):
+        with self._cond:
+            self._jpeg = jpeg_bytes
+            self._cond.notify_all()
+
+    def wait_for_frame(self, timeout=5.0):
+        with self._cond:
+            self._cond.wait(timeout)
+            return self._jpeg
+
+
+_frame_buffer = _FrameBuffer()
+
+
+def start_mjpeg_server(port):
+    """Serve _frame_buffer as multipart MJPEG at http://0.0.0.0:<port>/ in a daemon thread."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path not in ("/", "/stream", "/index.html"):
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "multipart/x-mixed-replace; boundary=frame"
+            )
+            self.send_header("Cache-Control", "no-cache, private")
+            self.end_headers()
+            try:
+                while True:
+                    jpeg = _frame_buffer.wait_for_frame()
+                    if jpeg is None:
+                        continue
+                    self.wfile.write(b"--frame\r\n")
+                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                    self.wfile.write(("Content-Length: %d\r\n\r\n" % len(jpeg)).encode())
+                    self.wfile.write(jpeg)
+                    self.wfile.write(b"\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client (browser/VLC) disconnected
+
+        def log_message(self, *args):
+            pass  # silence per-request logging
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 # Chip configuration - 4 types: white, red, blue, yellow
 CHIP_VALUES = {
@@ -71,6 +167,46 @@ class VideoCapture:
     def release(self):
         self.stopped = True
         self.cap.release()
+
+
+class Picamera2Capture:
+    """Capture directly from the Pi CSI camera (imx708 etc.) via picamera2.
+
+    Returns BGR frames to match the rest of the OpenCV pipeline. Used when the viewer runs
+    ON the Pi (PICHIP_SOURCE=picamera2) instead of pulling a remote TCP stream — OpenCV's
+    VideoCapture can't read the libcamera CSI camera directly.
+    """
+
+    def __init__(self, width=CAMERA_WIDTH, height=CAMERA_HEIGHT):
+        from picamera2 import Picamera2
+
+        self.picam2 = Picamera2()
+        config = self.picam2.create_preview_configuration(
+            main={"size": (width, height), "format": "RGB888"}
+        )
+        self.picam2.configure(config)
+        self.picam2.start()
+        # Camera Module 3 has autofocus — enable continuous AF so a chip tray placed at
+        # arm's length stays sharp. Harmless no-op on fixed-focus cameras. (AfMode 2 =
+        # Continuous; set numerically to avoid a hard libcamera.controls import.)
+        try:
+            self.picam2.set_controls({"AfMode": 2})
+        except Exception:
+            pass
+
+    def read(self):
+        # picamera2 "RGB888" yields a buffer already in BGR byte order for OpenCV, so we
+        # return it as-is unless the user asked to swap (PICHIP_CAMERA_SWAP_RB).
+        frame = self.picam2.capture_array()
+        if CAMERA_SWAP_RB:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        return frame
+
+    def release(self):
+        try:
+            self.picam2.stop()
+        except Exception:
+            pass
 
 
 def parse_label(label):
@@ -254,38 +390,83 @@ def main():
     model = YOLO(str(DETECTOR_PATH))
     print(f"Classes: {', '.join(model.names.values())}")
 
-    print("Starting video capture...")
-    cap = VideoCapture(STREAM_URL)
+    source = _resolve_source()
+    if source == "picamera2":
+        print("Starting Pi camera (picamera2)...")
+        cap = Picamera2Capture()
+    else:
+        print(f"Connecting to stream {STREAM_URL}...")
+        cap = VideoCapture(STREAM_URL)
 
-    print("PiChip Viewer (custom YOLO detector) - Press 'q' to quit")
+    print(
+        "PiChip Viewer (custom YOLO detector) — "
+        + ("headless" if HEADLESS else "press 'q' to quit")
+    )
+
+    if MJPEG_PORT:
+        start_mjpeg_server(MJPEG_PORT)
+        print(
+            f"MJPEG stream live on port {MJPEG_PORT} — open "
+            f"http://<pi-host>:{MJPEG_PORT}/ in a browser on the same network."
+        )
 
     frame_count = 0
+    processed = 0
     cached_detections = []
     cached_counts = defaultdict(int)
+    vis = None
 
-    while True:
-        frame = cap.read()
-        if frame is None:
-            continue
+    try:
+        while True:
+            frame = cap.read()
+            if frame is None:
+                continue
 
-        frame_count += 1
-        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame_count += 1
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Run detection periodically to keep the display smooth.
-        if frame_count % DETECT_INTERVAL == 1 or not cached_detections:
-            results = model.predict(
-                frame, conf=CONFIDENCE, device=device, verbose=False
-            )
-            cached_detections, cached_counts = detect(model, frame_gray, results)
+            # Run detection periodically to keep the display smooth.
+            if frame_count % DETECT_INTERVAL == 1 or not cached_detections:
+                results = model.predict(
+                    frame, conf=CONFIDENCE, device=device, verbose=False
+                )
+                cached_detections, cached_counts = detect(model, frame_gray, results)
 
-        vis = draw_visualization(frame, cached_detections, cached_counts)
-        cv2.imshow("PiChip Viewer", vis)
+            vis = draw_visualization(frame, cached_detections, cached_counts)
+            processed += 1
 
-        if (cv2.waitKey(1) & 0xFF) == ord("q"):
-            break
+            if MJPEG_PORT:
+                ok, buf = cv2.imencode(
+                    ".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, MJPEG_QUALITY]
+                )
+                if ok:
+                    _frame_buffer.update(buf.tobytes())
 
-    cap.release()
-    cv2.destroyAllWindows()
+            if not HEADLESS:
+                cv2.imshow("PiChip Viewer", vis)
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    break
+            elif processed % 30 == 0:
+                # No window over SSH — print a running summary so it's observable.
+                total = sum(
+                    c * CHIP_VALUES.get(col, 0) for col, c in cached_counts.items()
+                )
+                print(
+                    f"[frame {frame_count}] counts={dict(cached_counts)} total=${total}",
+                    flush=True,
+                )
+
+            if MAX_FRAMES and processed >= MAX_FRAMES:
+                break
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        if SNAPSHOT_PATH and vis is not None:
+            cv2.imwrite(SNAPSHOT_PATH, vis)
+            print(f"Saved annotated snapshot to {SNAPSHOT_PATH}")
+        cap.release()
+        if not HEADLESS:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
