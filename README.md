@@ -44,6 +44,10 @@ The system spans three places:
 3. **Output** — boxes + per-chip counts + a running value HUD, shown in a local window and/or
    served as an MJPEG HTTP stream.
 
+Inference runs in a **background thread**, so capture/display/streaming stay at full camera
+frame rate (~15 fps on a Pi 4) while detections refresh asynchronously a couple of times a
+second — the feed never freezes waiting on the model.
+
 ## Project structure
 
 ```
@@ -155,23 +159,34 @@ open-vocab YOLO-World mode instead.
 | `PICHIP_DETECTOR_PATH` | `models/pichip_detector.pt` | Detector loaded by the viewer (`.pt` or ONNX) |
 | `PICHIP_MJPEG_PORT` | `8090` | Serve the annotated feed at `http://<pi>:<port>/` (0 = off) |
 | `PICHIP_DEVICE` | `auto` | `auto`, `cpu`, `cuda`, `mps` (use `cpu` on the Pi) |
-| `PICHIP_DETECT_INTERVAL` | `5` | Run detection every N frames |
+| `PICHIP_IMGSZ` | `0` | Inference resolution (0 = model default). Lower (416/320) = faster, worse on small chips. Must match the ONNX export size — `deploy_model.sh` keeps them in sync. |
 | `PICHIP_CONFIDENCE` | `0.3` | Detection confidence threshold |
 | `PICHIP_CAMERA_WIDTH` / `PICHIP_CAMERA_HEIGHT` | `1280` / `720` | picamera2 capture size |
 | `PICHIP_CAMERA_SWAP_RB` | `0` | Set `1` if camera colors look red/blue-swapped |
 | `PICHIP_HEADLESS` | auto | Force no-window mode (auto-on when there's no display) |
 | `PICHIP_STREAM_URL` | `tcp://pichip.local:8888` | Remote TCP source, used only when `PICHIP_SOURCE=stream` |
 
-## Performance notes (Raspberry Pi 4, CPU)
+## Performance (Raspberry Pi 4, CPU)
 
-| Runtime | Speed | Notes |
-|---------|-------|-------|
-| PyTorch `.pt` @640 | ~1.3 fps | works, but slow |
-| **ONNX @640** | **~2.2 fps** | recommended — what `deploy_model.sh` produces |
-| NCNN | — | segfaults on this aarch64 / Python 3.13 build; not used |
+There are two distinct frame rates:
 
-~2 fps is fine for a mostly-static chip tray. Lower `PICHIP_CONFIDENCE` or retrain with more
-data if detection is weak (see TRAINING.md).
+- **Display / stream FPS** — how smooth the video is. ~**15 fps**, because inference runs in
+  a background thread (see "How it works"). This is what you watch.
+- **Detection refresh** — how often boxes/counts update. CPU-bound by the detector:
+
+  | Runtime | Detection speed | Notes |
+  |---------|-----------------|-------|
+  | PyTorch `.pt` @640 | ~1.3/s | works, but slow |
+  | **ONNX @640** | **~2.2/s** | recommended — what `deploy_model.sh` produces |
+  | ONNX @416 | ~4–5/s | `./deploy_model.sh "" 416` — faster, worse on small chips |
+  | NCNN | — | segfaults on this aarch64 / Python 3.13 build; not used |
+
+For a mostly-static chip tray, a couple of detection updates per second is plenty. To make
+**detection itself** real-time, the Pi 4 CPU is the ceiling — use a hardware accelerator
+(Coral USB Accelerator on the Pi 4, or a Pi 5 + Raspberry Pi AI Kit / Hailo).
+
+Other knobs: lower `PICHIP_IMGSZ`, drop `PICHIP_CAMERA_WIDTH`/`HEIGHT` or `PICHIP_MJPEG_QUALITY`
+for higher display fps, lower `PICHIP_CONFIDENCE`, or retrain with more data (see TRAINING.md).
 
 ## Chip values
 

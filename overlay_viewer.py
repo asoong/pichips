@@ -1,4 +1,5 @@
 import os
+import time
 import cv2
 import numpy as np
 from pathlib import Path
@@ -17,9 +18,13 @@ STREAM_URL = os.getenv("PICHIP_STREAM_URL", "tcp://pichip.local:8888")
 # class names (white_face, red_edge, ...) are embedded in the weights and read back via
 # model.names, so this file never hardcodes the class list.
 DETECTOR_PATH = Path(os.getenv("PICHIP_DETECTOR_PATH", "models/pichip_detector.pt"))
-DETECT_INTERVAL = int(os.getenv("PICHIP_DETECT_INTERVAL", "5"))
+DETECT_INTERVAL = int(os.getenv("PICHIP_DETECT_INTERVAL", "5"))  # legacy; unused (async now)
 CONFIDENCE = float(os.getenv("PICHIP_CONFIDENCE", "0.3"))
 DEVICE_PREF = os.getenv("PICHIP_DEVICE", "auto")
+# Inference resolution. 0 = the model's native size. Lower (e.g. 416/320) is much faster
+# on a Pi CPU but worse on small objects. With a static-shape ONNX model this must match
+# the size it was exported at (deploy_model.sh keeps them in sync).
+IMGSZ = int(os.getenv("PICHIP_IMGSZ", "0"))
 
 # Frame source: "stream" reads PICHIP_STREAM_URL over TCP (viewer runs on a separate
 # machine pulling the Pi's stream); "picamera2" captures the Pi's CSI camera directly
@@ -376,6 +381,53 @@ def get_device():
     return "cpu"
 
 
+class InferenceWorker(Thread):
+    """Runs detection on the latest frame in a background thread.
+
+    Decouples inference (~0.3-0.5s/frame on a Pi CPU) from capture/display/streaming, so
+    the feed runs at full camera frame rate and detections refresh asynchronously a couple
+    of times per second instead of freezing the whole loop on every inference.
+    """
+
+    def __init__(self, model, device):
+        super().__init__(daemon=True)
+        self.model = model
+        self.device = device
+        self._lock = Lock()
+        self._frame = None
+        self._detections = []
+        self._counts = defaultdict(int)
+        self._stop = False
+
+    def submit(self, frame):
+        with self._lock:
+            self._frame = frame
+
+    def latest(self):
+        with self._lock:
+            return self._detections, self._counts
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        predict_kw = {"conf": CONFIDENCE, "device": self.device, "verbose": False}
+        if IMGSZ:
+            predict_kw["imgsz"] = IMGSZ
+        while not self._stop:
+            with self._lock:
+                frame = self._frame
+                self._frame = None
+            if frame is None:
+                time.sleep(0.003)  # nothing new yet
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            results = self.model.predict(frame, **predict_kw)
+            dets, counts = detect(self.model, gray, results)
+            with self._lock:
+                self._detections, self._counts = dets, counts
+
+
 def main():
     if not DETECTOR_PATH.exists():
         raise SystemExit(
@@ -410,10 +462,12 @@ def main():
             f"http://<pi-host>:{MJPEG_PORT}/ in a browser on the same network."
         )
 
+    worker = InferenceWorker(model, device)
+    worker.start()
+
     frame_count = 0
     processed = 0
-    cached_detections = []
-    cached_counts = defaultdict(int)
+    last_print = time.time()
     vis = None
 
     try:
@@ -423,14 +477,10 @@ def main():
                 continue
 
             frame_count += 1
-            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-            # Run detection periodically to keep the display smooth.
-            if frame_count % DETECT_INTERVAL == 1 or not cached_detections:
-                results = model.predict(
-                    frame, conf=CONFIDENCE, device=device, verbose=False
-                )
-                cached_detections, cached_counts = detect(model, frame_gray, results)
+            # Inference runs in the background on the latest frame; this loop never blocks
+            # on it, so capture/display/stream stay at full camera frame rate.
+            worker.submit(frame)
+            cached_detections, cached_counts = worker.latest()
 
             vis = draw_visualization(frame, cached_detections, cached_counts)
             processed += 1
@@ -446,13 +496,17 @@ def main():
                 cv2.imshow("PiChip Viewer", vis)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
-            elif processed % 30 == 0:
-                # No window over SSH — print a running summary so it's observable.
+            elif processed % 60 == 0:
+                # No window over SSH — print live display FPS + counts so it's observable.
+                now = time.time()
+                fps = 60.0 / (now - last_print) if now > last_print else 0.0
+                last_print = now
                 total = sum(
                     c * CHIP_VALUES.get(col, 0) for col, c in cached_counts.items()
                 )
                 print(
-                    f"[frame {frame_count}] counts={dict(cached_counts)} total=${total}",
+                    f"[{processed} frames] {fps:.1f} fps display | "
+                    f"counts={dict(cached_counts)} total=${total}",
                     flush=True,
                 )
 
@@ -461,6 +515,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
+        worker.stop()
         if SNAPSHOT_PATH and vis is not None:
             cv2.imwrite(SNAPSHOT_PATH, vis)
             print(f"Saved annotated snapshot to {SNAPSHOT_PATH}")
